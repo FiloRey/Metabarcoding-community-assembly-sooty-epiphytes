@@ -92,7 +92,23 @@ library(writexl)
 library(ggdist)
 library(ARTool)
 library(tibble)
+library(permute)        # restricted permutations for blocked PERMANOVA
+library(iCAMP)          # phylogenetic-bin null modelling of community assembly
 set.seed(423542)
+
+# =============================================================================
+# AUGUST 2026 MAJOR-REVISION INTEGRATION
+# =============================================================================
+# Added/strengthened:
+# 1) explicit Block x Treatment and PlotID diagnostics;
+# 2) low-read + singleton ASV QC with exported reviewer tables;
+# 3) treatment-plot-aware random effects in alpha-diversity models;
+# 4) split-plot, block-restricted marginal Aitchison PERMANOVA;
+# 5) effect-specific PERMDISP permutation restrictions;
+# 6) iCAMP bin-size diagnostics + optional ps.bin phylogenetic-signal test;
+# 7) automatic mapping of selection-dominated iCAMP bins back to taxa;
+# 8) conditional 16S implementation of the same reviewer-revised pipeline.
+# =============================================================================
 
 # ===============================
 # COMMON PUBLICATION THEME -------------------------------------------------
@@ -188,20 +204,6 @@ unique_phyla <- unique(as.vector(tax_table(physeq_asv)[, "Phylum"]))
 unique_order <- unique(as.vector(tax_table(physeq_asv)[, "Order"]))
 unique_genus <- unique(as.vector(tax_table(physeq_asv)[, "Genus"]))
 
-# Basic info
-ntaxa(physeq_asv)
-nsamples(physeq_asv)
-sample_names(physeq_asv)
-rank_names(physeq_asv)
-sample_variables(physeq_asv)
-otu_table(physeq_asv)
-tax_table(physeq_asv)
-phy_tree(physeq_asv)
-
-unique_phyla <- unique(as.vector(tax_table(physeq_asv)[, "Phylum"]))
-unique_order <- unique(as.vector(tax_table(physeq_asv)[, "Order"]))
-unique_genus <- unique(as.vector(tax_table(physeq_asv)[, "Genus"]))
-
 # FILTER and FORMAT --------------------------
 unwanted_phyla <- c(
   NA,
@@ -226,6 +228,341 @@ sample_variables(physeq_asv_filtered)
 otu_table(physeq_asv_filtered)
 tax_table(physeq_asv_filtered)
 phy_tree(physeq_asv_filtered)
+
+# =============================================================================
+# STEP 1B: EXPERIMENTAL-DESIGN + SEQUENCING-DEPTH QC -- REVIEWER-REVISED
+# =============================================================================
+# Reviewer comments addressed here:
+# - explicitly verify how block and treatment are encoded;
+# - identify the true treatment-plot experimental unit;
+# - quantify low-read samples rather than silently discarding them;
+# - quantify global singleton ASVs rather than silently discarding them.
+#
+# Nothing is filtered in this QC section. The exported tables document the
+# dataset actually entering the inferential analyses.
+# =============================================================================
+
+get_sample_by_taxa_matrix <- function(ps) {
+  x <- as(phyloseq::otu_table(ps), "matrix")
+  if (phyloseq::taxa_are_rows(ps)) x <- t(x)
+  storage.mode(x) <- "numeric"
+  x
+}
+
+get_taxa_by_sample_matrix <- function(ps) {
+  x <- as(phyloseq::otu_table(ps), "matrix")
+  if (!phyloseq::taxa_are_rows(ps)) x <- t(x)
+  storage.mode(x) <- "numeric"
+  x
+}
+
+diagnose_experimental_units <- function(ps, prefix = "ITS") {
+  
+  meta_qc <- data.frame(
+    phyloseq::sample_data(ps)
+  ) %>%
+    tibble::rownames_to_column("SampleID")
+  
+  required_cols <- c(
+    "field",
+    "treatment",
+    "block",
+    "sampling"
+  )
+  
+  missing_cols <- setdiff(
+    required_cols,
+    colnames(meta_qc)
+  )
+  
+  if (length(missing_cols) > 0L) {
+    stop(
+      "Missing metadata columns: ",
+      paste(missing_cols, collapse = ", ")
+    )
+  }
+  
+  meta_qc <- meta_qc %>%
+    dplyr::mutate(
+      field = factor(field),
+      treatment = factor(treatment),
+      block = factor(block),
+      sampling = factor(
+        sampling,
+        levels = c("Harvest", "Storage")
+      ),
+      
+      # A/B/C are replicate labels reused within each Treatment.
+      # The independent physical experimental unit is therefore:
+      # Field x Treatment x Block.
+      ExperimentalUnitID = interaction(
+        field,
+        treatment,
+        block,
+        drop = TRUE
+      )
+    )
+  
+  # One row per independent physical experimental unit.
+  unit_structure <- meta_qc %>%
+    dplyr::distinct(
+      field,
+      treatment,
+      block,
+      ExperimentalUnitID
+    ) %>%
+    dplyr::arrange(
+      field,
+      treatment,
+      block
+    )
+  
+  # Replication of Treatment at the experimental-unit level.
+  treatment_replication <- unit_structure %>%
+    dplyr::count(
+      field,
+      treatment,
+      name = "N_independent_units"
+    ) %>%
+    dplyr::arrange(
+      field,
+      treatment
+    )
+  
+  # Number of apple samples in each Sampling stage within each unit.
+  sampling_structure <- meta_qc %>%
+    dplyr::count(
+      field,
+      treatment,
+      block,
+      ExperimentalUnitID,
+      sampling,
+      name = "N_samples"
+    ) %>%
+    dplyr::arrange(
+      field,
+      treatment,
+      block,
+      sampling
+    )
+  
+  # Wide table for checking Harvest/Storage balance.
+  unit_sampling_balance <- sampling_structure %>%
+    dplyr::select(
+      field,
+      treatment,
+      block,
+      ExperimentalUnitID,
+      sampling,
+      N_samples
+    ) %>%
+    tidyr::pivot_wider(
+      names_from = sampling,
+      values_from = N_samples,
+      values_fill = 0
+    )
+  
+  cat(
+    "\n================ EXPERIMENTAL UNITS:",
+    prefix,
+    "================\n"
+  )
+  
+  print(unit_structure)
+  print(treatment_replication)
+  
+  cat(
+    "\n================ SAMPLING BALANCE:",
+    prefix,
+    "================\n"
+  )
+  
+  print(unit_sampling_balance)
+  
+  # Each Field x Treatment should have replicated independent units.
+  if (any(treatment_replication$N_independent_units < 2L)) {
+    warning(
+      "At least one Field x Treatment has fewer than two ",
+      "independent experimental units."
+    )
+  }
+  
+  # Each experimental unit should contain both sampling stages.
+  if (
+    all(
+      c("Harvest", "Storage") %in%
+      colnames(unit_sampling_balance)
+    )
+  ) {
+    if (
+      any(unit_sampling_balance$Harvest == 0) ||
+      any(unit_sampling_balance$Storage == 0)
+    ) {
+      warning(
+        "At least one experimental unit is missing ",
+        "Harvest or Storage samples."
+      )
+    }
+  } else {
+    warning(
+      "Harvest and/or Storage columns were not found in the ",
+      "experimental-unit sampling-balance table."
+    )
+  }
+  
+  utils::write.csv(
+    unit_structure,
+    paste0(prefix, "_experimental_unit_structure.csv"),
+    row.names = FALSE
+  )
+  
+  utils::write.csv(
+    treatment_replication,
+    paste0(prefix, "_treatment_replication.csv"),
+    row.names = FALSE
+  )
+  
+  utils::write.csv(
+    sampling_structure,
+    paste0(prefix, "_experimental_unit_sampling_structure.csv"),
+    row.names = FALSE
+  )
+  
+  utils::write.csv(
+    unit_sampling_balance,
+    paste0(prefix, "_experimental_unit_sampling_balance.csv"),
+    row.names = FALSE
+  )
+  
+  list(
+    metadata = meta_qc,
+    unit_structure = unit_structure,
+    treatment_replication = treatment_replication,
+    sampling_structure = sampling_structure,
+    unit_sampling_balance = unit_sampling_balance
+  )
+}
+
+run_sequence_depth_qc <- function(
+    ps,
+    prefix = "ITS",
+    low_read_thresholds = c(1000, 5000, 10000, 15000)
+) {
+  counts_qc <- get_sample_by_taxa_matrix(ps)
+  lib_size_qc <- rowSums(counts_qc)
+  taxa_totals_qc <- colSums(counts_qc)
+  
+  if (any(lib_size_qc <= 0)) {
+    warning("Zero-read samples are present after taxonomic filtering.")
+  }
+  
+  global_singletons <- taxa_totals_qc == 1
+  n_singletons <- sum(global_singletons)
+  
+  singleton_reads_per_sample <- if (n_singletons > 0) {
+    rowSums(counts_qc[, global_singletons, drop = FALSE])
+  } else {
+    rep(0, nrow(counts_qc))
+  }
+  
+  meta_qc <- data.frame(phyloseq::sample_data(ps)) %>%
+    tibble::rownames_to_column("SampleID")
+  
+  sample_qc <- tibble::tibble(
+    SampleID = rownames(counts_qc),
+    LibrarySize = lib_size_qc,
+    SingletonReads = singleton_reads_per_sample,
+    SingletonFraction = ifelse(
+      lib_size_qc > 0,
+      singleton_reads_per_sample / lib_size_qc,
+      NA_real_
+    )
+  ) %>%
+    dplyr::left_join(meta_qc, by = "SampleID")
+  
+  for (cutoff in low_read_thresholds) {
+    sample_qc[[paste0("Below_", cutoff, "_reads")]] <-
+      sample_qc$LibrarySize < cutoff
+  }
+  
+  library_summary <- tibble::tibble(
+    Metric = c(
+      "Minimum", "1%", "5%", "25%", "Median",
+      "Mean", "75%", "95%", "99%", "Maximum"
+    ),
+    Reads = c(
+      min(lib_size_qc),
+      unname(quantile(lib_size_qc, 0.01)),
+      unname(quantile(lib_size_qc, 0.05)),
+      unname(quantile(lib_size_qc, 0.25)),
+      median(lib_size_qc),
+      mean(lib_size_qc),
+      unname(quantile(lib_size_qc, 0.75)),
+      unname(quantile(lib_size_qc, 0.95)),
+      unname(quantile(lib_size_qc, 0.99)),
+      max(lib_size_qc)
+    )
+  )
+  
+  low_read_summary <- tibble::tibble(
+    Threshold = low_read_thresholds,
+    N_below = vapply(
+      low_read_thresholds,
+      function(z) sum(lib_size_qc < z),
+      numeric(1)
+    ),
+    Percent_below = vapply(
+      low_read_thresholds,
+      function(z) 100 * mean(lib_size_qc < z),
+      numeric(1)
+    )
+  )
+  
+  singleton_summary <- tibble::tibble(
+    Total_ASVs = length(taxa_totals_qc),
+    Global_singleton_ASVs = n_singletons,
+    Singleton_ASV_percent = 100 * n_singletons / length(taxa_totals_qc),
+    Reads_in_singleton_ASVs = sum(taxa_totals_qc[global_singletons]),
+    Percent_reads_in_singletons =
+      100 * sum(taxa_totals_qc[global_singletons]) / sum(taxa_totals_qc)
+  )
+  
+  cat("\n================ LIBRARY-SIZE QC:", prefix, "================\n")
+  print(library_summary)
+  print(low_read_summary)
+  print(singleton_summary)
+  
+  write.csv(
+    sample_qc,
+    paste0(prefix, "_sample_library_size_QC.csv"),
+    row.names = FALSE
+  )
+  write.csv(
+    library_summary,
+    paste0(prefix, "_library_size_summary.csv"),
+    row.names = FALSE
+  )
+  write.csv(
+    low_read_summary,
+    paste0(prefix, "_low_read_summary.csv"),
+    row.names = FALSE
+  )
+  write.csv(
+    singleton_summary,
+    paste0(prefix, "_singleton_summary.csv"),
+    row.names = FALSE
+  )
+  
+  list(
+    sample_QC = sample_qc,
+    library_summary = library_summary,
+    low_read_summary = low_read_summary,
+    singleton_summary = singleton_summary
+  )
+}
+
+ITS_design <- diagnose_experimental_units(physeq_asv_filtered, prefix = "ITS")
+ITS_QC <- run_sequence_depth_qc(physeq_asv_filtered, prefix = "ITS")
 
 TSE <- convertFromPhyloseq(physeq_asv_filtered)
 
@@ -297,387 +634,2352 @@ altExp(tse_) <- addPrevalentAbundance(altExp(tse_), prevalence = 50/100, detecti
 plotHistogram(altExp(tse_), col.var = "prevalent_abundance")
 
 # ==============================
-# STEP 4: ALPHA DIVERSITY ANALYSIS 
-# ==============================
-# 1) Rarefaction curves -------------------------------------------------
 
-asv <- t(abundances(physeq_asv_filtered))
-rarefy_depth <- min(rowSums(asv))
-rarefy_depth <- 1000
-cat("Rarefying to:", rarefy_depth, "reads per sample\n")
 
-p_raref <- rarecurve(asv, step = 100, sample = rarefy_depth, tidy = TRUE)
+# ============================================================================
+# STEP 4: ALPHA DIVERSITY -- INTEGRATED REVIEWER-REVISED ANALYSIS
+# ============================================================================
+#
+# Purpose
+# -------
+# This script integrates TWO complementary approaches to unequal sequencing
+# depth without fixed-depth rarefaction:
+#
+# A) PRIMARY ANALYSIS
+#    Coverage-standardized taxonomic and phylogenetic alpha diversity using
+#    iNEXT.3D, followed by field-specific mixed-effects models.
+#
+# B) SENSITIVITY ANALYSIS
+#    Alpha-diversity metrics calculated directly from the complete,
+#    non-rarefied count table, followed by field-specific mixed-effects models
+#    with standardized log10 library size as a covariate.
+#
+# IMPORTANT: SINGLETONS ARE RETAINED.
+# ----------------------------------
+# No ASV is removed merely because it is a global or sample singleton.
+# The script reports singleton abundance for QC, but NEVER filters singletons.
+# This is important because rare ASVs contribute information about sampling
+# completeness, especially for richness / q = 0.
+#
+# Experimental design
+# -------------------
+# Models are fitted separately within each orchard/field because treatment
+# identities differ between orchards.
+#
+# Fixed effects within each field:
+#     Sampling * Treatment
+#
+# Random effect:
+#     (1 | ExperimentalUnitID)
+#
+# where:
+#     ExperimentalUnitID = Field x Treatment x Block
+#
+# Experimental design:
+# - A/B/C are replicate labels reused within each Treatment;
+# - each Field x Treatment x Block combination is one independent physical
+#   experimental unit;
+# - each treatment therefore has three independent replicate units per field;
+# - Harvest and Storage apples are sampled within the same experimental unit.
+#
+# Treatment is a BETWEEN-unit fixed effect and Sampling is a WITHIN-unit fixed
+# effect. The raw Block label alone is not used as a random effect because,
+# for example, Control-A and Geoxe-A are different physical units.
+#
+# Primary coverage-standardized metrics do NOT include library size again,
+# because sequencing effort has already been standardized by sample coverage.
+#
+# Observed-table sensitivity metrics and phylogenetic-structure metrics DO
+# include LibrarySize_z.
+#
+# Outputs include:
+# - singleton and library-size QC;
+# - iNEXT coverage QC;
+# - primary and sensitivity alpha-diversity tables;
+# - mixed-model Type-III tests;
+# - residual/convergence/singularity diagnostics;
+# - Harvest vs Storage EMM contrasts for all metrics;
+# - Harvest vs Storage contrasts within each treatment;
+# - treatment pairwise contrasts within each Sampling stage;
+# - a robustness/concordance table comparing iNEXT vs library-size-adjusted
+#   counterparts;
+# - main alpha-diversity figure using original metric scales and EMM deltas.
+# ============================================================================
 
-rare_16S <- ggplot(p_raref, aes(x = Sample, y = Species, group = Site, color = Site)) +
-  geom_line(linewidth = 0.8, alpha = 0.7) +
-  geom_vline(xintercept = rarefy_depth, linetype = "dashed", color = "black") +
-  labs(
-    x = "Sequencing Depth (reads)", 
-    y = "Observed Species (ASVs/OTUs)"
+
+# ============================================================================
+# 0. REQUIRED PACKAGES
+# ============================================================================
+
+required_packages <- c(
+  "phyloseq",
+  "iNEXT.3D",
+  "ape",
+  "picante",
+  "vegan",
+  "dplyr",
+  "tidyr",
+  "tibble",
+  "purrr",
+  "ggplot2",
+  "ggh4x",
+  "lme4",
+  "lmerTest",
+  "emmeans"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    quietly = TRUE,
+    FUN.VALUE = logical(1)
   )
+]
 
-rare_16S <- rare_ITS + theme(legend.position = "none")
-rare_16S
-saveRDS(rare_ITS, "rare_ITS.RDS")
-
-# 2) Alpha diversity calculation ----------------------------------------
-ps0.rar <- rarefy_even_depth(
-  physeq_asv_filtered, 
-  sample.size = rarefy_depth, 
-  rngseed = 123, 
-  verbose = FALSE
-)
-
-hmp.div <- microbiome::alpha(ps0.rar, index = "all")
-hmp.meta <- microbiome::meta(ps0.rar)
-hmp.meta$sam_name <- rownames(hmp.meta)
-hmp.div$sam_name <- rownames(hmp.div)
-
-# Merge metrics with metadata
-div.df <- merge(hmp.div, hmp.meta, by = "sam_name")
-
-# Select and rename metrics
-metrics <- c("Chao1","Shannon","Pielou","Dominance","Rarity")
-div.df2 <- div.df[, c("sam_name","sampling","treatment","field","class", "block",
-                      "chao1","diversity_shannon","evenness_pielou","dominance_relative","rarity_rare_abundance")]
-colnames(div.df2) <- c("sam_name","Sampling","Treatment","Field","Class", "Block",
-                       "Chao1","Shannon","Pielou","Dominance","Rarity")
-
-# Ensure correct types
-div.df2 <- div.df2 %>%
-  mutate(
-    Sampling  = factor(Sampling),
-    Treatment = factor(Treatment),
-    Block = factor(Block),
-    Field     = factor(Field),
-    Class     = factor(Class)
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the following packages before running STEP 4:\n",
+    paste(missing_packages, collapse = ", ")
   )
+}
 
-# 3) Raincloud plot: All metrics, Harvest vs Storage ----------------------
+# Use the manuscript theme if already defined in the master script.
+theme_alpha <- if (exists("theme_nature")) {
+  theme_nature
+} else {
+  ggplot2::theme_bw(base_size = 14)
+}
 
-metrics <- c("Chao1","Shannon","Pielou","Dominance","Rarity")
+# Reproducibility for any plotting jitter.
+set.seed(423542)
 
-#Mixed Models
-div_sub <- div.df2 %>%
-  dplyr::select(sam_name, Treatment, Sampling, Field, Block, Chao1, Pielou, Rarity, Shannon, Dominance)
 
-m_Chao1 <- lm(
-  Chao1 ~ Sampling + Field + Treatment,
-  data = div_sub
+# ============================================================================
+# 1. FULL NON-RAREFIED ASV TABLE -- SINGLETONS RETAINED
+# ============================================================================
+
+alpha_counts <- as(
+  phyloseq::otu_table(physeq_asv_filtered),
+  "matrix"
 )
 
-summary(m_Chao1)
-anova(m_Chao1)
+if (phyloseq::taxa_are_rows(physeq_asv_filtered)) {
+  alpha_counts <- t(alpha_counts)
+}
 
-# shannon
-m_shannon <- lm(
-  Shannon ~ Sampling + Field + Treatment,
-  data = div_sub
+storage.mode(alpha_counts) <- "numeric"
+
+# alpha_counts = samples x ASVs
+library_size <- rowSums(alpha_counts)
+taxa_totals  <- colSums(alpha_counts)
+
+if (any(library_size <= 0)) {
+  stop("Samples with zero library size are present after taxonomic filtering.")
+}
+
+# Explicit audit: no taxa have been removed here.
+if (ncol(alpha_counts) != phyloseq::ntaxa(physeq_asv_filtered)) {
+  stop("Unexpected ASV loss while constructing alpha_counts.")
+}
+
+# ---------------------------------------------------------------------------
+# Singleton QC ONLY -- DO NOT FILTER
+# ---------------------------------------------------------------------------
+
+global_singleton <- taxa_totals == 1
+n_global_singletons <- sum(global_singleton)
+
+# Number of within-sample count==1 observations (sample singletons).
+n_sample_singleton_occurrences <- sum(alpha_counts == 1)
+
+singleton_reads_per_sample <- if (n_global_singletons > 0L) {
+  rowSums(alpha_counts[, global_singleton, drop = FALSE])
+} else {
+  rep(0, nrow(alpha_counts))
+}
+
+singleton_summary <- tibble::tibble(
+  Total_ASVs = ncol(alpha_counts),
+  Global_singleton_ASVs = n_global_singletons,
+  Global_singleton_percent = 100 * n_global_singletons / ncol(alpha_counts),
+  Reads_in_global_singletons = sum(taxa_totals[global_singleton]),
+  Percent_reads_in_global_singletons =
+    100 * sum(taxa_totals[global_singleton]) / sum(taxa_totals),
+  Sample_singleton_occurrences = n_sample_singleton_occurrences,
+  Singleton_filter_applied = FALSE
 )
 
-summary(m_shannon)
-anova(m_shannon)
+print(singleton_summary)
 
-m_Pielou <- lm(
-  Pielou ~ Sampling + Field + Treatment,
-  data = div_sub
+utils::write.csv(
+  singleton_summary,
+  "alpha_singleton_QC_RETAINED.csv",
+  row.names = FALSE
 )
 
-summary(m_Pielou)
-anova(m_Pielou)
-
-
-# Dominance
-m_dominance <- lm(
-  Dominance ~ Sampling + Field + Treatment,
-  data = div_sub
+message(
+  "Singleton policy: RETAINED. Global singleton ASVs = ",
+  n_global_singletons,
+  ". No singleton filtering is applied in STEP 4."
 )
 
-summary(m_dominance)
-anova(m_dominance)
+# iNEXT.3D expects ASVs x samples.
+alpha_abun <- t(alpha_counts)
 
-# Dominance
-m_Rarity <- lm(
-  Rarity ~ Sampling + Field + Treatment,
-  data = div_sub
+
+# ============================================================================
+# 2. METADATA + EXPERIMENTAL UNITS
+# ============================================================================
+
+alpha_meta <- data.frame(
+  phyloseq::sample_data(physeq_asv_filtered)
+) %>%
+  tibble::rownames_to_column("sam_name")
+
+
+required_metadata <- c(
+  "field",
+  "treatment",
+  "block",
+  "sampling"
 )
 
-summary(m_Rarity)
-anova(m_Rarity)
+missing_metadata <- setdiff(
+  required_metadata,
+  colnames(alpha_meta)
+)
 
-par(mfrow = c(2,2))
-
-plot(m_shannon, which = 1)
-qqnorm(residuals(m_shannon)); qqline(residuals(m_shannon))
-
-plot(m_dominance, which = 1)
-qqnorm(residuals(m_dominance)); qqline(residuals(m_dominance))
-
-par(mfrow = c(1,1))
-
-
-# Function to collapse each metric into a single string with newlines
-make_label <- function(txt_vec) {
-  paste(txt_vec, collapse = "\n")
+if (length(missing_metadata) > 0L) {
+  stop(
+    "Missing metadata columns: ",
+    paste(missing_metadata, collapse = ", ")
+  )
 }
 
 
-shannon_results <- div_sub %>%
-  group_by(Field) %>%
-  nest() %>%
-  mutate(
-    model = map(data, ~ lm(Shannon ~ Sampling + Treatment, data = .x)),
-    tidy  = map(model, broom::tidy)
-  ) %>%
-  unnest(tidy)
-
-shannon_results
-
-shannon_sampling <- shannon_results %>%
-  filter(term == "SamplingStorage") %>%
-  dplyr::select(Field, estimate, p.value)
-
-shannon_sampling
-labels_shannon <- shannon_sampling %>%
-  mutate(
-    label = paste0(
-      "Δ = ", round(estimate,3),
-      "\np = ", signif(p.value,3)
+alpha_meta <- alpha_meta %>%
+  dplyr::mutate(
+    
+    Sampling = factor(
+      sampling,
+      levels = c("Harvest", "Storage")
+    ),
+    
+    Treatment = factor(treatment),
+    
+    Field = factor(field),
+    
+    Block = factor(block),
+    
+    # A/B/C are replicate labels reused within Treatment.
+    # The physical independent experimental unit is therefore
+    # Field x Treatment x Block.
+    ExperimentalUnitID = interaction(
+      Field,
+      Treatment,
+      Block,
+      drop = TRUE
     )
   )
-p_shannon <- ggplot(div_sub, aes(x = Sampling, y = Shannon, fill = Sampling)) +
-  stat_halfeye(
-    adjust = 0.6,
-    width = 0.6,
-    justification = -0.25,
-    alpha = 0.6,
-    slab_color = NA
-  ) +
-  geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.8) +
-  geom_jitter(width = 0.08, size = 1.6, alpha = 0.6) +
-  facet_wrap(~Field) +
-  geom_text(
-    data = labels_shannon,
-    aes(x = 1.5, y = Inf, label = label),
-    inherit.aes = FALSE,
-    vjust = 1.5
-  ) +
-  scale_fill_manual(values = c(Harvest = "#E64B35", Storage = "#4DBBD5")) +
-  labs(x = "Sampling", y = "Shannon") +
-  theme_nature +
-  theme(legend.position = "none")
 
-p_shannon
 
-# -------------------------------
-# Subset data per field
-# -------------------------------
-shannon_pfatten <- div.df2 %>% 
-  filter(Field == "Pfatten/Vadena") %>%
-  dplyr::select(Sampling, Treatment, Shannon) %>%
-  dplyr::rename(Value = Shannon)
+# ============================================================================
+# CHECK EXPERIMENTAL DESIGN
+# ============================================================================
 
-shannon_sinich <- div.df2 %>% 
-  filter(Field == "Sinich/Sinigo") %>%
-  dplyr::select(Sampling, Treatment, Shannon) %>%
-  dplyr::rename(Value = Shannon)
-
-# -------------------------------
-# Pfatten/Vadena: ART ANOVA
-# -------------------------------
-# Harvest
-shannon_pfatten_harvest <- shannon_pfatten %>% filter(Sampling == "Harvest")
-art_pf_harvest <- art(Value ~ Treatment, data = shannon_pfatten_harvest)
-aov_pf_harvest <- anova(art_pf_harvest)
-aov_pf_harvest  # view results
-
-# Posthoc
-ph_pf_harvest <- shannon_pfatten_harvest %>%
-  pairwise_wilcox_test(Value ~ Treatment)
-ph_pf_harvest
-
-# Storage
-shannon_pfatten_storage <- shannon_pfatten %>% filter(Sampling == "Storage")
-art_pf_storage <- art(Value ~ Treatment, data = shannon_pfatten_storage)
-aov_pf_storage <- anova(art_pf_storage)
-aov_pf_storage
-
-ph_pf_storage <- shannon_pfatten_storage %>%
-  pairwise_wilcox_test(Value ~ Treatment)
-ph_pf_storage
-
-# -------------------------------
-# Sinich/Sinigo: ART ANOVA
-# -------------------------------
-# Harvest
-shannon_sinich_harvest <- shannon_sinich %>% filter(Sampling == "Harvest")
-art_si_harvest <- art(Value ~ Treatment, data = shannon_sinich_harvest)
-aov_si_harvest <- anova(art_si_harvest)
-aov_si_harvest
-
-ph_si_harvest <- shannon_sinich_harvest %>%
-  pairwise_wilcox_test(Value ~ Treatment, p.adjust.method = "bonferroni")
-ph_si_harvest
-
-shannon_sinich_harvest %>%
-  group_by(Treatment) %>%
-  summarise(
-    n = n(),
-    mean_shannon = mean(Value, na.rm = TRUE),
-    median_shannon = median(Value, na.rm = TRUE),
-    sd_shannon = sd(Value, na.rm = TRUE)
+experimental_unit_structure <- alpha_meta %>%
+  dplyr::distinct(
+    Field,
+    Treatment,
+    Block,
+    ExperimentalUnitID
+  ) %>%
+  dplyr::arrange(
+    Field,
+    Treatment,
+    Block
   )
-# Storage
-shannon_sinich_storage <- shannon_sinich %>% filter(Sampling == "Storage")
-art_si_storage <- art(Value ~ Treatment, data = shannon_sinich_storage)
-aov_si_storage <- anova(art_si_storage)
-aov_si_storage
 
-ph_si_storage <- shannon_sinich_storage %>%
-  pairwise_wilcox_test(Value ~ Treatment, p.adjust.method = "bonferroni")
-ph_si_storage
+print(experimental_unit_structure)
 
+
+# Number of independent replicate units per treatment
+treatment_replication <- experimental_unit_structure %>%
+  dplyr::count(
+    Field,
+    Treatment,
+    name = "N_independent_units"
+  )
+
+print(treatment_replication)
+
+
+if (any(treatment_replication$N_independent_units < 2L)) {
+  
+  stop(
+    "At least one treatment has fewer than two ",
+    "independent experimental units."
+  )
+}
+
+
+# Check that each experimental unit contains both sampling stages
+unit_sampling <- alpha_meta %>%
+  dplyr::distinct(
+    Field,
+    ExperimentalUnitID,
+    Sampling
+  ) %>%
+  dplyr::count(
+    Field,
+    ExperimentalUnitID,
+    name = "N_sampling_stages"
+  )
+
+print(unit_sampling)
+
+
+if (any(unit_sampling$N_sampling_stages != 2L)) {
+  
+  warning(
+    "At least one experimental unit does not contain ",
+    "both Harvest and Storage."
+  )
+}
+# ============================================================================
+# 3. LIBRARY-SIZE + SINGLETON QC BY SAMPLE
+# ============================================================================
+
+library_qc <- tibble::tibble(
+  sam_name = rownames(alpha_counts),
+  LibrarySize = as.numeric(library_size),
+  GlobalSingletonReads = as.numeric(singleton_reads_per_sample),
+  GlobalSingletonFraction = singleton_reads_per_sample / library_size,
+  SampleSingletonASVs = rowSums(alpha_counts == 1)
+) %>%
+  dplyr::left_join(
+    alpha_meta,
+    by = "sam_name"
+  )
+
+utils::write.csv(
+  library_qc,
+  "alpha_library_and_singleton_QC.csv",
+  row.names = FALSE
+)
+
+p_library_size <- ggplot2::ggplot(
+  library_qc,
+  ggplot2::aes(
+    x = LibrarySize,
+    fill = Sampling
+  )
+) +
+  ggplot2::geom_histogram(
+    bins = 30,
+    alpha = 0.65,
+    position = "identity"
+  ) +
+  ggplot2::scale_x_log10() +
+  ggplot2::labs(
+    x = "Library size (reads, log10 scale)",
+    y = "Number of samples",
+    fill = "Sampling"
+  ) +
+  theme_alpha
+
+print(p_library_size)
+saveRDS(p_library_size, "alpha_library_size_QC.RDS")
+
+
+# ============================================================================
+# 4. PREPARE PHYLOGENETIC DATA
+# ============================================================================
+
+alpha_tree <- phyloseq::phy_tree(physeq_asv_filtered)
+
+common_taxa_alpha <- intersect(
+  colnames(alpha_counts),
+  alpha_tree$tip.label
+)
+
+if (length(common_taxa_alpha) < 2L) {
+  stop("Too few ASVs overlap between count table and phylogenetic tree.")
+}
+
+alpha_counts_phy <- alpha_counts[, common_taxa_alpha, drop = FALSE]
+alpha_abun_phy   <- t(alpha_counts_phy)
+alpha_tree_phy   <- ape::keep.tip(alpha_tree, common_taxa_alpha)
+
+phy_reads <- rowSums(alpha_counts_phy)
+phy_fraction <- phy_reads / library_size
+
+message(
+  "Median fraction of reads represented in phylogenetic tree = ",
+  round(stats::median(phy_fraction, na.rm = TRUE), 4)
+)
+
+phy_tree_qc <- tibble::tibble(
+  sam_name = rownames(alpha_counts_phy),
+  ReadsTotal = as.numeric(library_size[rownames(alpha_counts_phy)]),
+  ReadsInTree = as.numeric(phy_reads),
+  FractionReadsInTree = as.numeric(phy_fraction)
+)
+
+utils::write.csv(
+  phy_tree_qc,
+  "alpha_phylogenetic_tree_coverage_QC.csv",
+  row.names = FALSE
+)
+
+# ============================================================================
+# iNEXT.3D ELIGIBILITY
+# ============================================================================
+# iNEXT.3D requires at least 5 observed species/ASVs per assemblage.
+# Samples below this threshold are excluded ONLY from the iNEXT analysis.
+# They remain in the complete non-rarefied analysis.
+
+MIN_ASVS_INEXT <- 5L
+
+observed_asvs_tax <- rowSums(alpha_counts > 0)
+observed_asvs_phy <- rowSums(alpha_counts_phy > 0)
+
+inext_eligibility <- tibble::tibble(
+  sam_name = rownames(alpha_counts),
+  ObservedASVs_taxonomic = as.integer(observed_asvs_tax),
+  ObservedASVs_phylogenetic = as.integer(
+    observed_asvs_phy[rownames(alpha_counts)]
+  )
+) %>%
+  dplyr::mutate(
+    Eligible_iNEXT_TD =
+      ObservedASVs_taxonomic >= MIN_ASVS_INEXT,
+    
+    Eligible_iNEXT_PD =
+      ObservedASVs_phylogenetic >= MIN_ASVS_INEXT,
+    
+    Eligible_iNEXT =
+      Eligible_iNEXT_TD & Eligible_iNEXT_PD
+  ) %>%
+  dplyr::left_join(
+    alpha_meta,
+    by = "sam_name"
+  )
+
+print(
+  inext_eligibility %>%
+    dplyr::filter(!Eligible_iNEXT)
+)
+
+utils::write.csv(
+  inext_eligibility,
+  "Bacteria_iNEXT_sample_eligibility.csv",
+  row.names = FALSE
+)
+
+message(
+  "Bacterial samples retained for iNEXT.3D: ",
+  sum(inext_eligibility$Eligible_iNEXT),
+  " / ",
+  nrow(inext_eligibility)
+)
+
+message(
+  "Bacterial samples excluded from iNEXT.3D because <5 observed ASVs: ",
+  sum(!inext_eligibility$Eligible_iNEXT)
+)
+
+eligible_samples_inext <- inext_eligibility %>%
+  dplyr::filter(Eligible_iNEXT) %>%
+  dplyr::pull(sam_name)
+
+
+# Taxonomic diversity: ASVs x eligible samples
+alpha_abun_inext <- t(
+  alpha_counts[
+    eligible_samples_inext,
+    ,
+    drop = FALSE
+  ]
+)
+
+
+# Phylogenetic diversity: ASVs x eligible samples
+alpha_abun_phy_inext <- t(
+  alpha_counts_phy[
+    eligible_samples_inext,
+    ,
+    drop = FALSE
+  ]
+)
+
+# ============================================================================
+# PART A -- PRIMARY COVERAGE-STANDARDIZED ANALYSIS
+# ============================================================================
+
+# ============================================================================
+# 5A. SAMPLE-COVERAGE INFORMATION
+# ============================================================================
+
+coverage_info_TD <- iNEXT.3D::DataInfo3D(
+  data = alpha_abun_inext,
+  diversity = "TD",
+  datatype = "abundance"
+)
+
+coverage_info_PD <- iNEXT.3D::DataInfo3D(
+  data = alpha_abun_phy_inext,
+  diversity = "PD",
+  datatype = "abundance",
+  PDtree = alpha_tree_phy
+)
+
+find_coverage_column <- function(dat, doubled = FALSE) {
+  pattern <- if (doubled) "^SC\\(2 *n\\)$" else "^SC\\(n\\)$"
+  
+  hit <- grep(
+    pattern,
+    colnames(dat),
+    value = TRUE
+  )
+  
+  if (length(hit) != 1L) {
+    stop(
+      "Could not identify sample-coverage column. Columns are: ",
+      paste(colnames(dat), collapse = ", ")
+    )
+  }
+  
+  hit
+}
+
+SC_n_TD_col  <- find_coverage_column(coverage_info_TD, doubled = FALSE)
+SC_2n_TD_col <- find_coverage_column(coverage_info_TD, doubled = TRUE)
+SC_n_PD_col  <- find_coverage_column(coverage_info_PD, doubled = FALSE)
+SC_2n_PD_col <- find_coverage_column(coverage_info_PD, doubled = TRUE)
+
+# "2n" allows up to approximately 2x extrapolation.
+# "observed" avoids extrapolation entirely.
+INEXT_COVERAGE_RULE <- "2n"
+
+if (INEXT_COVERAGE_RULE == "2n") {
+  target_TD <- min(coverage_info_TD[[SC_2n_TD_col]], na.rm = TRUE)
+  target_PD <- min(coverage_info_PD[[SC_2n_PD_col]], na.rm = TRUE)
+} else if (INEXT_COVERAGE_RULE == "observed") {
+  target_TD <- min(coverage_info_TD[[SC_n_TD_col]], na.rm = TRUE)
+  target_PD <- min(coverage_info_PD[[SC_n_PD_col]], na.rm = TRUE)
+} else {
+  stop("INEXT_COVERAGE_RULE must be '2n' or 'observed'.")
+}
+
+# One common target across taxonomic and phylogenetic analyses.
+target_coverage <- min(target_TD, target_PD, 0.999999)
+target_coverage <- floor(target_coverage * 100000) / 100000
+
+message("Common iNEXT target coverage = ", target_coverage)
+
+coverage_qc <- coverage_info_TD %>%
+  dplyr::transmute(
+    sam_name = as.character(Assemblage),
+    LibrarySize = n,
+    ObservedRichness = S.obs,
+    CoverageObserved = .data[[SC_n_TD_col]],
+    Coverage2x = .data[[SC_2n_TD_col]]
+  ) %>%
+  dplyr::left_join(alpha_meta, by = "sam_name")
+
+utils::write.csv(
+  coverage_qc,
+  "iNEXT_sample_coverage_QC.csv",
+  row.names = FALSE
+)
+
+p_coverage <- ggplot2::ggplot(
+  coverage_qc,
+  ggplot2::aes(
+    x = Sampling,
+    y = CoverageObserved,
+    fill = Sampling
+  )
+) +
+  ggplot2::geom_boxplot(
+    width = 0.35,
+    outlier.shape = NA,
+    alpha = 0.7
+  ) +
+  ggplot2::geom_jitter(
+    width = 0.10,
+    size = 1.5,
+    alpha = 0.55
+  ) +
+  ggplot2::geom_hline(
+    yintercept = target_coverage,
+    linetype = 2
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = "Estimated sample coverage",
+    fill = "Sampling"
+  ) +
+  theme_alpha +
+  ggplot2::theme(legend.position = "none")
+
+print(p_coverage)
+saveRDS(p_coverage, "iNEXT_sample_coverage_QC.RDS")
+
+
+# ============================================================================
+# 6A. COVERAGE-STANDARDIZED TAXONOMIC DIVERSITY
+# ============================================================================
+# q = 0 : richness
+# q = 1 : Shannon effective diversity = exp(Shannon entropy)
+# q = 2 : inverse-Simpson effective diversity
+# q = 2 is NOT evenness.
+# ============================================================================
+
+TD_est <- iNEXT.3D::estimate3D(
+  data = alpha_abun_inext,
+  diversity = "TD",
+  q = c(0, 1, 2),
+  datatype = "abundance",
+  base = "coverage",
+  level = target_coverage,
+  nboot = 0
+)
+
+utils::write.csv(
+  TD_est,
+  "iNEXT_TD_coverage_standardized_full.csv",
+  row.names = FALSE
+)
+
+print(
+  TD_est %>%
+    dplyr::count(Order.q, Method)
+)
+
+TD_wide <- TD_est %>%
+  dplyr::transmute(
+    sam_name = as.character(Assemblage),
+    Metric = paste0("TD_q", as.integer(Order.q)),
+    Diversity = qTD
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = Metric,
+    values_from = Diversity
+  )
+
+
+# ============================================================================
+# 7A. COVERAGE-STANDARDIZED PHYLOGENETIC DIVERSITY
+# ============================================================================
+
+PD_est <- iNEXT.3D::estimate3D(
+  data = alpha_abun_phy_inext,
+  diversity = "PD",
+  q = c(0, 1, 2),
+  datatype = "abundance",
+  base = "coverage",
+  level = target_coverage,
+  nboot = 0,
+  PDtree = alpha_tree_phy,
+  PDtype = "meanPD"
+)
+
+# q=0 total branch-length form, analogous to Faith's PD.
+FaithPD_est <- iNEXT.3D::estimate3D(
+  data = alpha_abun_phy_inext,
+  diversity = "PD",
+  q = 0,
+  datatype = "abundance",
+  base = "coverage",
+  level = target_coverage,
+  nboot = 0,
+  PDtree = alpha_tree_phy,
+  PDtype = "PD"
+)
+
+utils::write.csv(
+  PD_est,
+  "iNEXT_PD_meanPD_coverage_standardized_full.csv",
+  row.names = FALSE
+)
+
+utils::write.csv(
+  FaithPD_est,
+  "iNEXT_FaithPD_coverage_standardized_full.csv",
+  row.names = FALSE
+)
+
+PD_wide <- PD_est %>%
+  dplyr::transmute(
+    sam_name = as.character(Assemblage),
+    Metric = paste0("PD_q", as.integer(Order.q)),
+    Diversity = qPD
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = Metric,
+    values_from = Diversity
+  )
+
+FaithPD_cov <- FaithPD_est %>%
+  dplyr::transmute(
+    sam_name = as.character(Assemblage),
+    FaithPD_cov = qPD
+  )
+
+# ============================================================================
+# 8A. PRIMARY COVERAGE-STANDARDIZED DATASET
+# ============================================================================
+
+alpha_primary <- TD_wide %>%
+  dplyr::left_join(PD_wide, by = "sam_name") %>%
+  dplyr::left_join(FaithPD_cov, by = "sam_name") %>%
+  dplyr::left_join(alpha_meta, by = "sam_name") %>%
+  dplyr::mutate(
+    HillEvenness = dplyr::if_else(
+      TD_q0 > 0,
+      TD_q1 / TD_q0,
+      NA_real_
+    )
+  )
+
+utils::write.csv(
+  alpha_primary,
+  "alpha_PRIMARY_iNEXT_coverage_standardized.csv",
+  row.names = FALSE
+)
+
+primary_metrics <- c(
+  "TD_q0",
+  "TD_q1",
+  "TD_q2",
+  "HillEvenness",
+  "FaithPD_cov",
+  "PD_q1",
+  "PD_q2"
+)
+
+primary_labels <- c(
+  TD_q0 = "Richness (q = 0)",
+  TD_q1 = "Shannon effective diversity (q = 1)",
+  TD_q2 = "Inverse Simpson effective diversity (q = 2)",
+  HillEvenness = "Hill evenness (D1/D0)",
+  FaithPD_cov = "Faith's phylogenetic diversity",
+  PD_q1 = "Phylogenetic diversity (q = 1)",
+  PD_q2 = "Phylogenetic diversity (q = 2)"
+)
+
+
+# ============================================================================
+# PART B -- NON-RAREFIED + LIBRARY-SIZE-COVARIATE SENSITIVITY ANALYSIS
+# ============================================================================
+
+# ============================================================================
+# 5B. OBSERVED TAXONOMIC ALPHA DIVERSITY -- FULL COUNTS
+# ============================================================================
+# SINGLETONS REMAIN PRESENT.
+# ============================================================================
+
+Observed_raw <- vegan::specnumber(alpha_counts)
+Shannon_raw <- vegan::diversity(alpha_counts, index = "shannon")
+ShannonEffective_raw <- exp(Shannon_raw)
+InvSimpson_raw <- vegan::diversity(alpha_counts, index = "invsimpson")
+Pielou_raw <- ifelse(
+  Observed_raw > 1,
+  Shannon_raw / log(Observed_raw),
+  NA_real_
+)
+
+alpha_tax_raw <- tibble::tibble(
+  sam_name = rownames(alpha_counts),
+  LibrarySize = as.numeric(library_size),
+  Observed_raw = Observed_raw,
+  Shannon_raw = Shannon_raw,
+  ShannonEffective_raw = ShannonEffective_raw,
+  InvSimpson_raw = InvSimpson_raw,
+  Pielou_raw = Pielou_raw
+)
+
+
+# ============================================================================
+# 6B. OBSERVED PHYLOGENETIC ALPHA DIVERSITY / STRUCTURE
+# ============================================================================
+
+faith_pd_raw <- picante::pd(
+  alpha_counts_phy,
+  alpha_tree_phy,
+  include.root = TRUE
+)
+
+psv_out <- picante::psv(
+  alpha_counts_phy,
+  alpha_tree_phy,
+  compute.var = FALSE
+)
+
+psr_out <- picante::psr(
+  alpha_counts_phy,
+  alpha_tree_phy,
+  compute.var = FALSE
+)
+
+pse_out <- picante::pse(
+  alpha_counts_phy,
+  alpha_tree_phy
+)
+
+alpha_phy_raw <- tibble::tibble(
+  sam_name = rownames(alpha_counts_phy),
+  FaithPD_raw = faith_pd_raw$PD,
+  PSV = psv_out$PSV,
+  PSR = psr_out$PSR,
+  PSE = pse_out$PSE,
+  # Explicitly derived convenience index; interpret as relatedness/redundancy,
+  # not as an independent standard phylogenetic-diversity estimator.
+  PhyloRedundancy = 1 - psv_out$PSV
+)
+
+
+# ============================================================================
+# 7B. SENSITIVITY DATASET + LIBRARY-SIZE COVARIATE
+# ============================================================================
+
+alpha_sensitivity <- alpha_tax_raw %>%
+  dplyr::left_join(alpha_phy_raw, by = "sam_name") %>%
+  dplyr::left_join(alpha_meta, by = "sam_name") %>%
+  dplyr::mutate(
+    LibrarySize_log10 = log10(LibrarySize),
+    LibrarySize_z = as.numeric(scale(LibrarySize_log10))
+  )
+
+utils::write.csv(
+  alpha_sensitivity,
+  "alpha_SENSITIVITY_nonrarefied_librarysize_adjusted.csv",
+  row.names = FALSE
+)
+
+sensitivity_metrics <- c(
+  "Observed_raw",
+  "Shannon_raw",
+  "ShannonEffective_raw",
+  "InvSimpson_raw",
+  "Pielou_raw",
+  "FaithPD_raw",
+  "PSV",
+  "PSR",
+  "PSE",
+  "PhyloRedundancy"
+)
+
+sensitivity_labels <- c(
+  Observed_raw = "Observed richness",
+  Shannon_raw = "Shannon entropy",
+  ShannonEffective_raw = "Shannon effective diversity",
+  InvSimpson_raw = "Inverse Simpson diversity",
+  Pielou_raw = "Pielou evenness",
+  FaithPD_raw = "Faith's phylogenetic diversity",
+  PSV = "Phylogenetic species variability",
+  PSR = "Phylogenetic species richness",
+  PSE = "Phylogenetic species evenness",
+  PhyloRedundancy = "Phylogenetic relatedness (1 - PSV)"
+)
+
+
+# ============================================================================
+# 9. FIELD-SPECIFIC MIXED-MODEL FITTING FUNCTIONS
+# ============================================================================
+# The two orchards have different treatment identities, so models are fitted
+# separately within each Field rather than using a global Field x Treatment
+# factorial.
+#
+# The independent physical experimental unit is Field x Treatment x Block.
+# The A/B/C labels are replicate labels reused within each Treatment, so the raw
+# Block label alone is not a shared blocking factor across treatments.
+# Multiple apples and both Sampling stages occur within each ExperimentalUnitID.
+# ExperimentalUnitID is therefore included as a random intercept.
+# Treatment is a fixed BETWEEN-unit factor and Sampling is a fixed WITHIN-unit
+# factor.
+# ============================================================================
+
+prepare_field_data <- function(dat, field_i) {
+  out <- dat %>%
+    dplyr::filter(Field == field_i) %>%
+    droplevels()
+  
+  if (nlevels(out$Sampling) != 2L) {
+    stop("Field ", field_i, " does not contain both Sampling levels.")
+  }
+  
+  if (nlevels(out$Treatment) < 2L) {
+    stop("Field ", field_i, " contains <2 Treatment levels.")
+  }
+  
+  contrasts(out$Sampling) <- stats::contr.sum(nlevels(out$Sampling))
+  contrasts(out$Treatment) <- stats::contr.sum(nlevels(out$Treatment))
+  
+  out
+}
+
+fit_primary_model <- function(field_i, metric_i) {
+  dat <- prepare_field_data(alpha_primary, field_i)
+  
+  f <- stats::as.formula(
+    paste0(
+      metric_i,
+      " ~ Sampling * Treatment + ",
+      "(1 | ExperimentalUnitID)"
+    )
+  )
+  
+  message("PRIMARY | ", field_i, " | ", metric_i, " | ", deparse(f))
+  
+  lmerTest::lmer(
+    f,
+    data = dat,
+    REML = TRUE,
+    na.action = na.omit,
+    control = lme4::lmerControl(
+      optimizer = "bobyqa",
+      optCtrl = list(maxfun = 200000)
+    )
+  )
+}
+
+fit_sensitivity_model <- function(field_i, metric_i) {
+  dat <- prepare_field_data(alpha_sensitivity, field_i)
+  
+  f <- stats::as.formula(
+    paste0(
+      metric_i,
+      " ~ Sampling * Treatment + LibrarySize_z + ",
+      "(1 | ExperimentalUnitID)"
+    )
+  )
+  
+  message("SENSITIVITY | ", field_i, " | ", metric_i, " | ", deparse(f))
+  
+  lmerTest::lmer(
+    f,
+    data = dat,
+    REML = TRUE,
+    na.action = na.omit,
+    control = lme4::lmerControl(
+      optimizer = "bobyqa",
+      optCtrl = list(maxfun = 200000)
+    )
+  )
+}
+
+fields_alpha <- levels(droplevels(alpha_meta$Field))
+
+primary_registry <- tidyr::expand_grid(
+  Field = fields_alpha,
+  Metric = primary_metrics
+) %>%
+  dplyr::mutate(
+    Analysis = "Primary_coverage_standardized",
+    MetricLabel = unname(primary_labels[Metric]),
+    Model = purrr::map2(Field, Metric, fit_primary_model)
+  )
+
+sensitivity_registry <- tidyr::expand_grid(
+  Field = fields_alpha,
+  Metric = sensitivity_metrics
+) %>%
+  dplyr::mutate(
+    Analysis = "Sensitivity_nonrarefied_librarysize",
+    MetricLabel = unname(sensitivity_labels[Metric]),
+    Model = purrr::map2(Field, Metric, fit_sensitivity_model)
+  )
+
+model_registry <- dplyr::bind_rows(
+  primary_registry,
+  sensitivity_registry
+)
+
+
+# ============================================================================
+# 10. MODEL DIAGNOSTICS
+# ============================================================================
+# Raw response values do not have to be normally distributed.
+# For Gaussian LMMs, inspect residuals, QQ plots, heteroscedasticity patterns,
+# convergence, extreme residuals and singular random-effect fits.
+# ============================================================================
+
+dir.create(
+  "alpha_model_diagnostics_integrated",
+  showWarnings = FALSE
+)
+
+extract_model_diagnostics <- function(
+    model_i,
+    field_i,
+    metric_i,
+    analysis_i
+) {
+  residual_i <- stats::residuals(model_i)
+  fitted_i <- stats::fitted(model_i)
+  
+  std_residual_i <- if (stats::sd(residual_i, na.rm = TRUE) > 0) {
+    as.numeric(scale(residual_i))
+  } else {
+    rep(0, length(residual_i))
+  }
+  
+  if (length(residual_i) >= 3L && length(residual_i) <= 5000L) {
+    shapiro_i <- stats::shapiro.test(residual_i)
+    Shapiro_W <- unname(shapiro_i$statistic)
+    Shapiro_p <- shapiro_i$p.value
+  } else {
+    Shapiro_W <- NA_real_
+    Shapiro_p <- NA_real_
+  }
+  
+  conv_message <- model_i@optinfo$conv$lme4$messages
+  if (is.null(conv_message)) {
+    conv_message <- NA_character_
+  } else {
+    conv_message <- paste(conv_message, collapse = " | ")
+  }
+  
+  tibble::tibble(
+    Analysis = analysis_i,
+    Field = field_i,
+    Metric = metric_i,
+    N = stats::nobs(model_i),
+    AIC = stats::AIC(model_i),
+    BIC = stats::BIC(model_i),
+    Singular = lme4::isSingular(model_i, tol = 1e-4),
+    ConvergenceMessage = conv_message,
+    Shapiro_W = Shapiro_W,
+    Shapiro_p = Shapiro_p,
+    MaxAbsStdResidual = max(abs(std_residual_i), na.rm = TRUE),
+    N_StdResidual_gt3 = sum(abs(std_residual_i) > 3, na.rm = TRUE),
+    Cor_AbsResidual_Fitted = suppressWarnings(
+      stats::cor(abs(residual_i), fitted_i, use = "complete.obs")
+    )
+  )
+}
+
+model_diagnostics <- purrr::pmap_dfr(
+  list(
+    model_registry$Model,
+    model_registry$Field,
+    model_registry$Metric,
+    model_registry$Analysis
+  ),
+  extract_model_diagnostics
+)
+
+model_diagnostics <- model_diagnostics %>%
+  dplyr::mutate(
+    Flag_Singular = Singular,
+    Flag_Convergence = !is.na(ConvergenceMessage),
+    Flag_ExtremeResidual = N_StdResidual_gt3 > 0,
+    Flag_HeteroscedasticTrend =
+      !is.na(Cor_AbsResidual_Fitted) & abs(Cor_AbsResidual_Fitted) > 0.30,
+    # Shapiro is reported but deliberately NOT included in the overall flag.
+    # A significant Shapiro test alone is not a reason to reject an LMM.
+    Flag_Shapiro_only = !is.na(Shapiro_p) & Shapiro_p < 0.05,
+    AnyMajorDiagnosticFlag =
+      Flag_Singular |
+      Flag_Convergence |
+      Flag_ExtremeResidual |
+      Flag_HeteroscedasticTrend
+  )
+
+print(model_diagnostics)
+
+utils::write.csv(
+  model_diagnostics,
+  "alpha_integrated_model_diagnostics_summary.csv",
+  row.names = FALSE
+)
+
+save_diagnostic_plot <- function(
+    model_i,
+    field_i,
+    metric_i,
+    analysis_i
+) {
+  safe <- function(x) gsub("[^A-Za-z0-9]+", "_", x)
+  
+  file_i <- file.path(
+    "alpha_model_diagnostics_integrated",
+    paste0(
+      safe(analysis_i), "__",
+      safe(field_i), "__",
+      safe(metric_i), ".pdf"
+    )
+  )
+  
+  residual_i <- stats::residuals(model_i)
+  fitted_i <- stats::fitted(model_i)
+  
+  grDevices::pdf(file_i, width = 9, height = 4.5)
+  graphics::par(mfrow = c(1, 2))
+  
+  graphics::plot(
+    fitted_i,
+    residual_i,
+    pch = 16,
+    cex = 0.7,
+    xlab = "Fitted values",
+    ylab = "Residuals",
+    main = paste(analysis_i, field_i, metric_i, "Residuals vs fitted", sep = "\n")
+  )
+  graphics::abline(h = 0, lty = 2)
+  
+  stats::qqnorm(
+    residual_i,
+    pch = 16,
+    cex = 0.7,
+    main = paste(analysis_i, field_i, metric_i, "Normal Q-Q", sep = "\n")
+  )
+  stats::qqline(residual_i)
+  
+  grDevices::dev.off()
+}
+
+purrr::pwalk(
+  list(
+    model_registry$Model,
+    model_registry$Field,
+    model_registry$Metric,
+    model_registry$Analysis
+  ),
+  save_diagnostic_plot
+)
+
+
+# ============================================================================
+# 11. RANDOM-EFFECT VARIANCES
+# ============================================================================
+
+random_effect_variances <- purrr::pmap_dfr(
+  list(
+    model_registry$Model,
+    model_registry$Field,
+    model_registry$Metric,
+    model_registry$Analysis
+  ),
+  function(model_i, field_i, metric_i, analysis_i) {
+    as.data.frame(lme4::VarCorr(model_i)) %>%
+      dplyr::mutate(
+        Analysis = analysis_i,
+        Field = field_i,
+        Metric = metric_i,
+        .before = 1
+      )
+  }
+)
+
+utils::write.csv(
+  random_effect_variances,
+  "alpha_integrated_random_effect_variances.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================================
+# 12. TYPE-III OMNIBUS TESTS
+# ============================================================================
+
+alpha_type3 <- purrr::pmap_dfr(
+  list(
+    model_registry$Model,
+    model_registry$Field,
+    model_registry$Metric,
+    model_registry$MetricLabel,
+    model_registry$Analysis
+  ),
+  function(model_i, field_i, metric_i, label_i, analysis_i) {
+    as.data.frame(
+      stats::anova(
+        model_i,
+        type = 3,
+        ddf = "Satterthwaite"
+      )
+    ) %>%
+      tibble::rownames_to_column("Effect") %>%
+      dplyr::mutate(
+        Analysis = analysis_i,
+        Field = field_i,
+        Metric = metric_i,
+        MetricLabel = label_i,
+        .before = 1
+      )
+  }
+)
+
+utils::write.csv(
+  alpha_type3,
+  "TABLE_alpha_integrated_TypeIII_by_field.csv",
+  row.names = FALSE
+)
+
+# Explicit library-size effects from sensitivity models.
+library_size_effects <- alpha_type3 %>%
+  dplyr::filter(
+    Analysis == "Sensitivity_nonrarefied_librarysize",
+    Effect == "LibrarySize_z"
+  )
+
+utils::write.csv(
+  library_size_effects,
+  "TABLE_alpha_sensitivity_library_size_effects.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================================
+# 13. POST-HOC HELPER FUNCTIONS
+# ============================================================================
+
+extract_stage_overall <- function(
+    model_i,
+    field_i,
+    metric_i,
+    label_i,
+    analysis_i
+) {
+  emm_i <- emmeans::emmeans(
+    model_i,
+    ~ Sampling,
+    weights = "equal"
+  )
+  
+  emmeans::contrast(
+    emm_i,
+    method = list("Storage - Harvest" = c(-1, 1)),
+    adjust = "none"
+  ) %>%
+    summary(infer = c(TRUE, TRUE)) %>%
+    as.data.frame() %>%
+    dplyr::mutate(
+      Analysis = analysis_i,
+      Field = field_i,
+      Metric = metric_i,
+      MetricLabel = label_i,
+      .before = 1
+    )
+}
+
+extract_stage_within_treatment <- function(
+    model_i,
+    field_i,
+    metric_i,
+    label_i,
+    analysis_i
+) {
+  emm_i <- emmeans::emmeans(
+    model_i,
+    ~ Sampling | Treatment
+  )
+  
+  emmeans::contrast(
+    emm_i,
+    method = list("Storage - Harvest" = c(-1, 1)),
+    adjust = "none"
+  ) %>%
+    summary(infer = c(TRUE, TRUE)) %>%
+    as.data.frame() %>%
+    dplyr::mutate(
+      Analysis = analysis_i,
+      Field = field_i,
+      Metric = metric_i,
+      MetricLabel = label_i,
+      .before = 1
+    )
+}
+
+extract_treatment_pairwise <- function(
+    model_i,
+    field_i,
+    metric_i,
+    label_i,
+    analysis_i
+) {
+  emm_i <- emmeans::emmeans(
+    model_i,
+    ~ Treatment | Sampling
+  )
+  
+  emmeans::contrast(
+    emm_i,
+    method = "pairwise",
+    adjust = "tukey"
+  ) %>%
+    summary(infer = c(TRUE, TRUE)) %>%
+    as.data.frame() %>%
+    dplyr::mutate(
+      Analysis = analysis_i,
+      Field = field_i,
+      Metric = metric_i,
+      MetricLabel = label_i,
+      .before = 1
+    )
+}
+
+
+# ============================================================================
+# 14. HARVEST vs STORAGE -- ALL METRICS WITHIN EACH FIELD
+# ============================================================================
+# estimate = original-scale EMM difference: Storage - Harvest.
+# ============================================================================
+
+stage_overall_all <- purrr::pmap_dfr(
+  list(
+    model_registry$Model,
+    model_registry$Field,
+    model_registry$Metric,
+    model_registry$MetricLabel,
+    model_registry$Analysis
+  ),
+  extract_stage_overall
+)
+
+# Holm within each Analysis x Field family across reported alpha metrics.
+stage_overall_all <- stage_overall_all %>%
+  dplyr::group_by(Analysis, Field) %>%
+  dplyr::mutate(
+    p.value.Holm = stats::p.adjust(p.value, method = "holm")
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    Significance = dplyr::case_when(
+      p.value.Holm < 0.001 ~ "***",
+      p.value.Holm < 0.01  ~ "**",
+      p.value.Holm < 0.05  ~ "*",
+      TRUE                 ~ "ns"
+    )
+  )
+
+utils::write.csv(
+  stage_overall_all,
+  "TABLE_alpha_Harvest_vs_Storage_ALL_integrated.csv",
+  row.names = FALSE
+)
+
+utils::write.csv(
+  stage_overall_all %>%
+    dplyr::filter(Analysis == "Primary_coverage_standardized"),
+  "TABLE_alpha_Harvest_vs_Storage_PRIMARY_iNEXT.csv",
+  row.names = FALSE
+)
+
+utils::write.csv(
+  stage_overall_all %>%
+    dplyr::filter(Analysis == "Sensitivity_nonrarefied_librarysize"),
+  "TABLE_alpha_Harvest_vs_Storage_SENSITIVITY_librarysize.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================================
+# 15. HARVEST vs STORAGE WITHIN EACH TREATMENT
+# ============================================================================
+
+stage_within_treatment_all <- purrr::pmap_dfr(
+  list(
+    model_registry$Model,
+    model_registry$Field,
+    model_registry$Metric,
+    model_registry$MetricLabel,
+    model_registry$Analysis
+  ),
+  extract_stage_within_treatment
+)
+
+# Holm across treatment-specific Harvest-vs-Storage tests within each
+# Analysis x Field x Metric family.
+stage_within_treatment_all <- stage_within_treatment_all %>%
+  dplyr::group_by(Analysis, Field, Metric) %>%
+  dplyr::mutate(
+    p.value.Holm = stats::p.adjust(p.value, method = "holm")
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    Significance = dplyr::case_when(
+      p.value.Holm < 0.001 ~ "***",
+      p.value.Holm < 0.01  ~ "**",
+      p.value.Holm < 0.05  ~ "*",
+      TRUE                 ~ "ns"
+    )
+  )
+
+utils::write.csv(
+  stage_within_treatment_all,
+  "TABLE_alpha_Harvest_vs_Storage_WITHIN_TREATMENT_integrated.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================================
+# 16. TREATMENT COMPARISONS WITHIN EACH FIELD x SAMPLING STAGE
+# ============================================================================
+
+treatment_pairwise_all <- purrr::pmap_dfr(
+  list(
+    model_registry$Model,
+    model_registry$Field,
+    model_registry$Metric,
+    model_registry$MetricLabel,
+    model_registry$Analysis
+  ),
+  extract_treatment_pairwise
+) %>%
+  dplyr::mutate(
+    Significance = dplyr::case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE            ~ "ns"
+    )
+  )
+
+utils::write.csv(
+  treatment_pairwise_all,
+  "TABLE_alpha_TREATMENT_PAIRWISE_within_Field_Sampling_integrated.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================================
+# 17. ROBUSTNESS / CONCORDANCE TABLE:
+#     iNEXT COVERAGE STANDARDIZATION vs LIBRARY-SIZE COVARIATE
+# ============================================================================
+# Conceptually matched pairs:
+#   TD_q0       <-> Observed_raw
+#   TD_q1       <-> ShannonEffective_raw
+#   TD_q2       <-> InvSimpson_raw
+#   HillEvenness<-> Pielou_raw        (both evenness, not identical formulae)
+#   FaithPD_cov <-> FaithPD_raw
+# ============================================================================
+
+metric_crosswalk <- tibble::tribble(
+  ~PrimaryMetric, ~SensitivityMetric, ~ComparisonMeaning,
+  "TD_q0",        "Observed_raw",         "Richness",
+  "TD_q1",        "ShannonEffective_raw", "Shannon effective diversity",
+  "TD_q2",        "InvSimpson_raw",       "Inverse Simpson effective diversity",
+  "HillEvenness", "Pielou_raw",           "Evenness (related but not identical estimators)",
+  "FaithPD_cov",  "FaithPD_raw",          "Faith's phylogenetic diversity"
+)
+
+primary_stage <- stage_overall_all %>%
+  dplyr::filter(Analysis == "Primary_coverage_standardized") %>%
+  dplyr::select(
+    Field,
+    PrimaryMetric = Metric,
+    PrimaryEstimate = estimate,
+    PrimarySE = SE,
+    PrimaryP = p.value,
+    PrimaryPHolm = p.value.Holm,
+    PrimarySignificance = Significance
+  )
+
+sensitivity_stage <- stage_overall_all %>%
+  dplyr::filter(Analysis == "Sensitivity_nonrarefied_librarysize") %>%
+  dplyr::select(
+    Field,
+    SensitivityMetric = Metric,
+    SensitivityEstimate = estimate,
+    SensitivitySE = SE,
+    SensitivityP = p.value,
+    SensitivityPHolm = p.value.Holm,
+    SensitivitySignificance = Significance
+  )
+
+robustness_table <- metric_crosswalk %>%
+  dplyr::left_join(primary_stage, by = "PrimaryMetric") %>%
+  dplyr::left_join(
+    sensitivity_stage,
+    by = c("Field", "SensitivityMetric")
+  ) %>%
+  dplyr::mutate(
+    SameDirection =
+      sign(PrimaryEstimate) == sign(SensitivityEstimate),
+    PrimarySignificant = PrimaryPHolm < 0.05,
+    SensitivitySignificant = SensitivityPHolm < 0.05,
+    SameSignificanceConclusion =
+      PrimarySignificant == SensitivitySignificant
+  )
+
+print(robustness_table)
+
+utils::write.csv(
+  robustness_table,
+  "TABLE_alpha_ROBUSTNESS_iNEXT_vs_librarysize.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================================
+# 18. MAIN FIGURE -- PRIMARY COVERAGE-STANDARDIZED METRICS
+# ============================================================================
+# The figure shows raw/original metric values, NOT z-scores.
+# Each metric row has an independent x scale.
+# Delta is the EMM Storage - Harvest difference from the primary mixed model.
+#
+# Main biological story:
+# - Shannon effective diversity: overall abundance-weighted diversity;
+# - Hill evenness: increasing/decreasing dominance;
+# - Faith's PD: phylogenetic breadth.
+#
+# Additional richness, inverse-Simpson and phylogenetic metrics are retained
+# in the tables above.
+# ============================================================================
+
+plot_metrics_main <- c(
+  "TD_q1",
+  "HillEvenness",
+  "FaithPD_cov"
+)
+
+plot_labels_main <- c(
+  TD_q1 = "Shannon effective diversity (q = 1)",
+  HillEvenness = "Hill evenness (D1/D0)",
+  FaithPD_cov = "Faith's phylogenetic diversity"
+)
+
+alpha_plot_main <- alpha_primary %>%
+  dplyr::select(
+    sam_name,
+    Field,
+    Sampling,
+    dplyr::all_of(plot_metrics_main)
+  ) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(plot_metrics_main),
+    names_to = "Metric",
+    values_to = "Value"
+  ) %>%
+  dplyr::filter(!is.na(Value)) %>%
+  dplyr::mutate(
+    Metric = factor(
+      Metric,
+      levels = rev(plot_metrics_main),
+      labels = rev(plot_labels_main[plot_metrics_main])
+    ),
+    Sampling = factor(Sampling, levels = c("Harvest", "Storage"))
+  )
+
+figure_posthoc <- stage_overall_all %>%
+  dplyr::filter(
+    Analysis == "Primary_coverage_standardized",
+    Metric %in% plot_metrics_main
+  ) %>%
+  dplyr::mutate(
+    Metric = factor(
+      Metric,
+      levels = rev(plot_metrics_main),
+      labels = rev(plot_labels_main[plot_metrics_main])
+    ),
+    p_label = dplyr::case_when(
+      p.value.Holm < 0.001 ~ "p < 0.001",
+      TRUE ~ paste0(
+        "p = ",
+        formatC(p.value.Holm, format = "f", digits = 3)
+      )
+    ),
+    label = paste0(
+      "Delta = ",
+      formatC(estimate, format = "fg", digits = 3),
+      "\n",
+      p_label,
+      " ",
+      Significance
+    ),
+    Sampling = factor("Storage", levels = c("Harvest", "Storage"))
+  )
+
+p_alpha_main <- ggplot2::ggplot(
+  alpha_plot_main,
+  ggplot2::aes(
+    x = Value,
+    y = Sampling,
+    fill = Sampling,
+    color = Sampling
+  )
+) +
+  ggplot2::geom_boxplot(
+    width = 0.28,
+    outlier.shape = NA,
+    alpha = 0.65
+  ) +
+  ggplot2::geom_point(
+    position = ggplot2::position_jitter(
+      width = 0,
+      height = 0.08
+    ),
+    size = 1.5,
+    alpha = 0.55
+  ) +
+  ggplot2::geom_text(
+    data = figure_posthoc,
+    ggplot2::aes(
+      x = Inf,
+      y = Sampling,
+      label = label
+    ),
+    inherit.aes = FALSE,
+    hjust = 1.08,
+    vjust = -0.20,
+    size = 3.2
+  ) +
+  ggh4x::facet_grid2(
+    rows = ggplot2::vars(Metric),
+    cols = ggplot2::vars(Field),
+    scales = "free_x",
+    independent = "x",
+    switch = "y"
+  ) +
+  ggplot2::scale_fill_manual(
+    values = c(Harvest = "#E64B35", Storage = "#4DBBD5")
+  ) +
+  ggplot2::scale_color_manual(
+    values = c(Harvest = "#E64B35", Storage = "#4DBBD5")
+  ) +
+  ggplot2::scale_x_continuous(
+    expand = ggplot2::expansion(mult = c(0.03, 0.22))
+  ) +
+  ggplot2::labs(
+    x = "Alpha-diversity value",
+    y = NULL,
+    fill = NULL,
+    color = NULL
+  ) +
+  theme_alpha +
+  ggplot2::theme(
+    legend.position = "top",
+    legend.title = ggplot2::element_blank(),
+    # Harvest/Storage are identified by color + legend.
+    axis.text.y = ggplot2::element_blank(),
+    axis.ticks.y = ggplot2::element_blank(),
+    strip.text.x = ggplot2::element_text(face = "bold", size = 13),
+    strip.text.y.left = ggplot2::element_text(
+      angle = 0,
+      face = "bold",
+      size = 10
+    ),
+    panel.spacing.y = grid::unit(0.55, "lines")
+  )
+
+print(p_alpha_main)
+
+saveRDS(
+  p_alpha_main,
+  "Alpha_diversity_PRIMARY_iNEXT_mixed_models.RDS"
+)
+
+ggplot2::ggsave(
+  filename = "Alpha_diversity_PRIMARY_iNEXT_mixed_models.png",
+  plot = p_alpha_main,
+  width = 11,
+  height = 5.8,
+  units = "in",
+  dpi = 600
+)
+
+
+# ============================================================================
+# 19. MAIN-FIGURE POST-HOC TABLE
+# ============================================================================
+
+main_figure_table <- stage_overall_all %>%
+  dplyr::filter(
+    Analysis == "Primary_coverage_standardized",
+    Metric %in% plot_metrics_main
+  ) %>%
+  dplyr::select(
+    Field,
+    Metric,
+    MetricLabel,
+    contrast,
+    estimate,
+    SE,
+    df,
+    lower.CL,
+    upper.CL,
+    p.value,
+    p.value.Holm,
+    Significance
+  )
+
+utils::write.csv(
+  main_figure_table,
+  "TABLE_alpha_MAIN_FIGURE_Harvest_vs_Storage.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================================
+# 20. SESSION / ANALYSIS SETTINGS SUMMARY
+# ============================================================================
+
+analysis_settings <- tibble::tibble(
+  Setting = c(
+    "Fixed-depth rarefaction",
+    "Singleton filtering",
+    "Primary depth adjustment",
+    "Sensitivity depth adjustment",
+    "iNEXT coverage rule",
+    "iNEXT target coverage",
+    "Primary model",
+    "Sensitivity model",
+    "Field handling",
+    "Stage contrast",
+    "Stage multiplicity correction"
+  ),
+  Value = c(
+    "No",
+    "No - global and sample singletons retained",
+    "Coverage standardization with iNEXT.3D",
+    "standardized log10 library size covariate",
+    INEXT_COVERAGE_RULE,
+    as.character(target_coverage),
+    "Metric ~ Sampling * Treatment + (1|ExperimentalUnitID)",
+    "Metric ~ Sampling * Treatment + LibrarySize_z + (1|ExperimentalUnitID)",
+    "Separate model per Field",
+    "Storage - Harvest estimated marginal mean contrast",
+    "Holm within Analysis x Field"
+  )
+)
+
+print(analysis_settings)
+
+utils::write.csv(
+  analysis_settings,
+  "alpha_integrated_analysis_settings.csv",
+  row.names = FALSE
+)
+
+capture.output(
+  sessionInfo(),
+  file = "alpha_integrated_sessionInfo.txt"
+)
+
+# ============================================================================
+# END STEP 4
+# ============================================================================
+
+
+# STEP 5: BETA DIVERSITY -- REVIEWER-REVISED
 # ==============================
-# STEP 5: BETA DIVERSITY 
-# ==============================
+# Reviewer comments addressed here:
+# - no rarefaction;
+# - Aitchison distance replaces Bray-Curtis for inferential community-composition analysis;
+# - CLR is scale invariant, so CSS is not applied before Aitchison distance;
+# - PERMANOVA uses marginal tests (by = "margin");
+# - 9,999 permutations are used;
+# - permutations respect block as the independent treatment experimental unit.
 
-# 1) CSS normalization ----------------------------------------------------
+# 1) Genus-level counts and CLR transformation ---------------------------
 tse__2 <- tse__fresh
-# Agglomerate to Genus 
 tse__2 <- agglomerateByRank(tse__2, rank = "Genus", update.tree = TRUE)
-# Filter low-abundance samples
-counts <- assay(tse__2, "counts") 
-keep_samples <- colSums(counts > 0) > 1 
-counts <- counts[, keep_samples] 
+
+counts_beta <- assay(tse__2, "counts")
+keep_samples <- colSums(counts_beta) > 0
+counts_beta <- counts_beta[, keep_samples, drop = FALSE]
 tse__2 <- tse__2[, keep_samples]
-# Create MRexperiment and CSS normalization 
-mr_obj <- newMRexperiment(counts)
-p <- cumNormStatFast(mr_obj) 
-mr_obj <- cumNorm(mr_obj, p = p)
-# Extract normalized log2 counts
-norm_counts <- MRcounts(mr_obj, norm = TRUE, log = F) 
-norm_counts <- norm_counts[rownames(tse__2), colnames(tse__2)] 
-assay(tse__2, "css_norm") <- norm_counts
+
+# Remove extremely sparse genera before log-ratio analysis.
+# This is a prevalence filter, NOT a library-size normalization.
+min_prev <- 0.05
+keep_taxa <- rowSums(counts_beta > 0) >= ceiling(min_prev * ncol(counts_beta))
+counts_beta <- counts_beta[keep_taxa, , drop = FALSE]
+tse__2 <- tse__2[keep_taxa, ]
+
+# CLR requires strictly positive values. A small count-scale pseudocount is
+# used only to define log-ratios for zeros; no rarefaction or CSS is applied.
+clr_pseudocount <- 0.5
+clr_counts <- apply(counts_beta, 2, function(x) {
+  lx <- log(x + clr_pseudocount)
+  lx - mean(lx)
+})
+clr_counts <- as.matrix(clr_counts)
+rownames(clr_counts) <- rownames(counts_beta)
+colnames(clr_counts) <- colnames(counts_beta)
+
+# Euclidean distance in CLR space = Aitchison distance.
+aitchison_dist <- stats::dist(t(clr_counts), method = "euclidean")
 
 meta <- as.data.frame(colData(tse__2))
-meta <- meta[colnames(norm_counts), ]
-meta$sampling  <- factor(meta$sampling)
+meta <- meta[colnames(clr_counts), , drop = FALSE]
+meta$sampling  <- factor(meta$sampling, levels = c("Harvest", "Storage"))
 meta$treatment <- factor(meta$treatment)
 meta$field     <- factor(meta$field)
+meta$block     <- factor(meta$block)
 
+# A/B/C are replicate labels reused within each Treatment.
+# The independent physical experimental unit is Field x Treatment x Block.
+meta$ExperimentalUnitID <- interaction(
+  meta$field,
+  meta$treatment,
+  meta$block,
+  drop = TRUE
+)
 
-# 2) dbRDA -------------------------------------------------------------------
-dbrda_all <- capscale(t(norm_counts) ~ sampling + treatment + field,
-                      data = meta, distance = "bray")
+# 2) Constrained ordination in Aitchison space --------------------------
+dbrda_all <- vegan::capscale(
+  aitchison_dist ~ sampling + treatment + field,
+  data = meta
+)
 
-dbrda_scores <- as.data.frame(scores(dbrda_all, display = "sites"))
+dbrda_scores <- as.data.frame(vegan::scores(dbrda_all, display = "sites"))
 dbrda_scores$Sampling  <- meta$sampling
 dbrda_scores$Treatment <- meta$treatment
 dbrda_scores$Field     <- meta$field
 
-
 fields <- levels(meta$field)
 sampling_levels <- levels(meta$sampling)
 
+# 3) Experimental-unit-aware marginal PERMANOVA + PERMDISP ----------------
+PERMUTATIONS_N <- 9999L
 
-# 3) PERMANOVA ------------------------------------------------------------
-field_results <- list()
+# Experimental design within each field
+# -------------------------------------
+# A/B/C are replicate labels reused within each Treatment:
+#
+#   Control: A, B, C
+#   Geoxe:   A, B, C
+#   Ulmasud: A, B, C
+#
+# Thus "A" under Control and "A" under Geoxe are DIFFERENT physical units.
+# The independent unit is:
+#
+#   ExperimentalUnitID = Field x Treatment x Block
+#
+# Multiple apples are sampled from each experimental unit at Harvest and
+# Storage.
+#
+# Sampling is therefore a WITHIN-unit factor.
+# Treatment is a BETWEEN-unit factor.
+#
+# Sampling and Treatment require different permutation restrictions. To retain
+# marginal tests (by = "margin"), the same model is fitted twice:
+#
+#   community ~ sampling + treatment
+#
+# - Sampling P-value: observations permuted within ExperimentalUnitID.
+# - Treatment P-value: complete ExperimentalUnitID groups permuted.
+#
+# Only the valid marginal row for each effect is retained in the combined
+# PERMANOVA table.
 
-for(f in fields){
+
+validate_experimental_unit_design <- function(dat) {
   
-  idx <- meta$field == f
-  counts_sub <- norm_counts[, idx]
-  meta_sub <- meta[idx, ]
+  dat <- droplevels(dat)
   
-  dist_sub <- vegdist(t(counts_sub), method = "bray")
-  
-  # PERMANOVA: sampling + treatment
-  permanova_res <- adonis2(
-    dist_sub ~ sampling + treatment,
-    data = meta_sub,
-    permutations = 999,
-    by = "margin"
+  required_cols <- c(
+    "field",
+    "treatment",
+    "block",
+    "sampling",
+    "ExperimentalUnitID"
   )
   
-  # PERMDISP for sampling
-  permdisp_sampling <- betadisper(dist_sub, meta_sub$sampling)
-  perm_sampling <- permutest(permdisp_sampling)
+  missing_cols <- setdiff(
+    required_cols,
+    colnames(dat)
+  )
   
-  # PERMDISP for treatment
-  permdisp_treatment <- betadisper(dist_sub, meta_sub$treatment)
-  perm_treatment <- permutest(permdisp_treatment)
+  if (length(missing_cols) > 0L) {
+    stop(
+      "Missing metadata columns: ",
+      paste(missing_cols, collapse = ", ")
+    )
+  }
   
-  field_results[[f]] <- list(
-    permanova = permanova_res,
-    permdisp_sampling = perm_sampling,
-    permdisp_treatment = perm_treatment
+  # One treatment per physical experimental unit.
+  unit_treatment <- dat %>%
+    dplyr::distinct(
+      ExperimentalUnitID,
+      treatment
+    ) %>%
+    dplyr::count(
+      ExperimentalUnitID,
+      name = "N_treatments"
+    )
+  
+  if (any(unit_treatment$N_treatments != 1L)) {
+    stop(
+      "At least one ExperimentalUnitID is associated with more than one Treatment."
+    )
+  }
+  
+  # Replication at the physical-unit level.
+  treatment_replication <- dat %>%
+    dplyr::distinct(
+      ExperimentalUnitID,
+      treatment
+    ) %>%
+    dplyr::count(
+      treatment,
+      name = "N_independent_units"
+    )
+  
+  if (any(treatment_replication$N_independent_units < 2L)) {
+    stop(
+      "At least one Treatment has fewer than two independent experimental units."
+    )
+  }
+  
+  invisible(treatment_replication)
+}
+
+
+# -------------------------------------------------------------------------
+# Sampling permutation
+#
+# Harvest/Storage labels are permuted only among observations belonging to
+# the same physical ExperimentalUnitID.
+# -------------------------------------------------------------------------
+
+make_sampling_permutation <- function(
+    dat,
+    nperm = PERMUTATIONS_N
+) {
+  
+  dat <- droplevels(dat)
+  
+  ctrl <- permute::how(
+    blocks = dat$ExperimentalUnitID,
+    nperm = nperm
+  )
+  
+  possible <- permute::numPerms(
+    seq_len(nrow(dat)),
+    control = ctrl
+  )
+  
+  message(
+    "Available within-unit permutations for Sampling: ",
+    possible
+  )
+  
+  ctrl
+}
+
+
+# -------------------------------------------------------------------------
+# Treatment permutation
+#
+# Treatment is assigned between independent experimental units. Therefore
+# complete ExperimentalUnitID groups are permuted while their internal sample
+# structure is kept intact.
+#
+# The plot-level permutation machinery in permute is used here only to move
+# complete physical units. There is NO additional block stratum because A/B/C
+# are replicate labels reused independently within each treatment.
+# -------------------------------------------------------------------------
+
+make_treatment_permutation <- function(
+    dat,
+    nperm = PERMUTATIONS_N
+) {
+  
+  dat <- droplevels(dat)
+  
+  validate_experimental_unit_design(dat)
+  
+  unit_n <- table(
+    dat$ExperimentalUnitID
+  )
+  
+  if (length(unique(as.numeric(unit_n))) != 1L) {
+    
+    print(unit_n)
+    
+    stop(
+      "Whole-unit Treatment permutation requires equal numbers of observations ",
+      "per ExperimentalUnitID."
+    )
+  }
+  
+  # For the combined Harvest + Storage analysis, verify that all units have
+  # the same sampling-stage layout.
+  if (
+    "sampling" %in% colnames(dat) &&
+    nlevels(dat$sampling) > 1L
+  ) {
+    
+    unit_sampling <- table(
+      dat$ExperimentalUnitID,
+      dat$sampling
+    )
+    
+    reference_row <- as.numeric(
+      unit_sampling[1, ]
+    )
+    
+    same_layout <- apply(
+      unit_sampling,
+      1,
+      function(x) {
+        identical(
+          as.numeric(x),
+          reference_row
+        )
+      }
+    )
+    
+    if (!all(same_layout)) {
+      
+      print(unit_sampling)
+      
+      stop(
+        "Whole-unit Treatment permutation requires the same Harvest/Storage ",
+        "sample layout in every ExperimentalUnitID."
+      )
+    }
+  }
+  
+  ctrl <- permute::how(
+    within = permute::Within(
+      type = "none"
+    ),
+    plots = permute::Plots(
+      strata = dat$ExperimentalUnitID,
+      type = "free"
+    ),
+    nperm = nperm
+  )
+  
+  possible <- permute::numPerms(
+    seq_len(nrow(dat)),
+    control = ctrl
+  )
+  
+  message(
+    "Available whole-unit permutations for Treatment: ",
+    possible
+  )
+  
+  ctrl
+}
+
+
+# -------------------------------------------------------------------------
+# Combine valid marginal rows
+# -------------------------------------------------------------------------
+
+combine_marginal_permanova <- function(
+    sampling_fit,
+    treatment_fit
+) {
+  
+  sampling_tab <- as.data.frame(
+    sampling_fit
+  )
+  
+  treatment_tab <- as.data.frame(
+    treatment_fit
+  )
+  
+  rbind(
+    sampling =
+      sampling_tab[
+        "sampling",
+        ,
+        drop = FALSE
+      ],
+    treatment =
+      treatment_tab[
+        "treatment",
+        ,
+        drop = FALSE
+      ],
+    Residual =
+      sampling_tab[
+        "Residual",
+        ,
+        drop = FALSE
+      ],
+    Total =
+      sampling_tab[
+        "Total",
+        ,
+        drop = FALSE
+      ]
   )
 }
 
 
+# =========================================================================
+# 3A) OVERALL ANALYSIS WITHIN EACH FIELD
+#
+# community ~ sampling + treatment
+#
+# Sampling:
+#   marginal effect, permutations within ExperimentalUnitID
+#
+# Treatment:
+#   marginal effect, whole ExperimentalUnitID permutations
+# =========================================================================
+
+field_results <- list()
+
+for (f in fields) {
+  
+  idx <- meta$field == f
+  
+  meta_sub <- droplevels(
+    meta[
+      idx,
+      ,
+      drop = FALSE
+    ]
+  )
+  
+  # Keep observations belonging to a physical unit contiguous and give all
+  # units the same internal Harvest/Storage ordering.
+  ord <- order(
+    meta_sub$ExperimentalUnitID,
+    meta_sub$sampling,
+    rownames(meta_sub)
+  )
+  
+  meta_sub <- meta_sub[
+    ord,
+    ,
+    drop = FALSE
+  ]
+  
+  clr_sub <- clr_counts[
+    ,
+    rownames(meta_sub),
+    drop = FALSE
+  ]
+  
+  dist_sub <- stats::dist(
+    t(clr_sub),
+    method = "euclidean"
+  )
+  
+  validate_experimental_unit_design(
+    meta_sub
+  )
+  
+  
+  # ---------------- Sampling effect ----------------
+  
+  perm_sampling <- make_sampling_permutation(
+    meta_sub
+  )
+  
+  permanova_sampling_full <- vegan::adonis2(
+    dist_sub ~ sampling + treatment,
+    data = meta_sub,
+    permutations = perm_sampling,
+    by = "margin"
+  )
+  
+  
+  # ---------------- Treatment effect ----------------
+  
+  perm_treatment <- make_treatment_permutation(
+    meta_sub
+  )
+  
+  permanova_treatment_full <- vegan::adonis2(
+    dist_sub ~ sampling + treatment,
+    data = meta_sub,
+    permutations = perm_treatment,
+    by = "margin"
+  )
+  
+  
+  # One table with the valid P-value for each factor.
+  permanova_res <- combine_marginal_permanova(
+    sampling_fit = permanova_sampling_full,
+    treatment_fit = permanova_treatment_full
+  )
+  
+  
+  # ---------------- PERMDISP: Sampling ----------------
+  
+  permdisp_sampling <- vegan::betadisper(
+    dist_sub,
+    meta_sub$sampling
+  )
+  
+  permdisp_sampling_test <- vegan::permutest(
+    permdisp_sampling,
+    permutations = perm_sampling
+  )
+  
+  
+  # ---------------- PERMDISP: Treatment ----------------
+  
+  permdisp_treatment <- vegan::betadisper(
+    dist_sub,
+    meta_sub$treatment
+  )
+  
+  permdisp_treatment_test <- vegan::permutest(
+    permdisp_treatment,
+    permutations = perm_treatment
+  )
+  
+  
+  field_results[[f]] <- list(
+    permanova = permanova_res,
+    permanova_sampling_full = permanova_sampling_full,
+    permanova_treatment_full = permanova_treatment_full,
+    permdisp_sampling = permdisp_sampling_test,
+    permdisp_treatment = permdisp_treatment_test,
+    metadata = meta_sub
+  )
+}
+
+
+# =========================================================================
+# 3B) TREATMENT EFFECT WITHIN EACH SAMPLING STAGE
+#
+# Treatment remains a between-unit effect when Harvest and Storage are
+# analysed separately, so complete ExperimentalUnitID groups are permuted.
+# =========================================================================
+
 field_sampling_results <- list()
 
-for(f in fields){
-  for(s in sampling_levels){
-    key <- paste(f, s, sep="_")
+for (f in fields) {
+  
+  for (smp in sampling_levels) {
     
-    idx <- meta$field == f & meta$sampling == s
-    counts_sub <- norm_counts[, idx]
-    meta_sub <- meta[idx, ]
+    key <- paste(
+      f,
+      smp,
+      sep = "_"
+    )
     
-    dist_sub <- vegdist(t(counts_sub), method = "bray")
+    idx <-
+      meta$field == f &
+      meta$sampling == smp
     
-    # PERMANOVA: treatment only
-    permanova_res <- adonis2(
+    meta_sub <- droplevels(
+      meta[
+        idx,
+        ,
+        drop = FALSE
+      ]
+    )
+    
+    if (
+      nrow(meta_sub) < 4L ||
+      nlevels(meta_sub$treatment) < 2L
+    ) {
+      next
+    }
+    
+    ord <- order(
+      meta_sub$ExperimentalUnitID,
+      rownames(meta_sub)
+    )
+    
+    meta_sub <- meta_sub[
+      ord,
+      ,
+      drop = FALSE
+    ]
+    
+    clr_sub <- clr_counts[
+      ,
+      rownames(meta_sub),
+      drop = FALSE
+    ]
+    
+    dist_sub <- stats::dist(
+      t(clr_sub),
+      method = "euclidean"
+    )
+    
+    validate_experimental_unit_design(
+      meta_sub
+    )
+    
+    perm_treatment <- make_treatment_permutation(
+      meta_sub
+    )
+    
+    permanova_res <- vegan::adonis2(
       dist_sub ~ treatment,
       data = meta_sub,
-      permutations = 999,
+      permutations = perm_treatment,
       by = "margin"
     )
     
-    # PERMDISP: treatment only
-    permdisp_treatment <- betadisper(dist_sub, meta_sub$treatment)
-    perm_treatment <- permutest(permdisp_treatment)
+    permdisp_treatment <- vegan::betadisper(
+      dist_sub,
+      meta_sub$treatment
+    )
+    
+    permdisp_treatment_test <- vegan::permutest(
+      permdisp_treatment,
+      permutations = perm_treatment
+    )
     
     field_sampling_results[[key]] <- list(
       permanova = permanova_res,
-      permdisp_treatment = perm_treatment
+      permdisp_treatment = permdisp_treatment_test,
+      metadata = meta_sub
     )
   }
 }
 
 
-# Example: PERMANOVA + PERMDISP for Pfatten/Vadena (sampling + treatment)
+# =========================================================================
+# 3C) PRINT RESULTS
+# =========================================================================
+
+# Pfatten/Vadena overall
 field_results[["Pfatten/Vadena"]]$permanova
 field_results[["Pfatten/Vadena"]]$permdisp_sampling
 field_results[["Pfatten/Vadena"]]$permdisp_treatment
 
+# Sinich/Sinigo overall
 field_results[["Sinich/Sinigo"]]$permanova
 field_results[["Sinich/Sinigo"]]$permdisp_sampling
 field_results[["Sinich/Sinigo"]]$permdisp_treatment
 
-# Example: PERMANOVA + PERMDISP for Pfatten/Vadena Harvest (treatment only)
+# Pfatten/Vadena within Sampling
 field_sampling_results[["Pfatten/Vadena_Harvest"]]$permanova
 field_sampling_results[["Pfatten/Vadena_Harvest"]]$permdisp_treatment
-field_sampling_results[["Sinich/Sinigo_Harvest"]]$permanova
-field_sampling_results[["Sinich/Sinigo_Harvest"]]$permdisp_treatment
-# Example: PERMANOVA + PERMDISP for Sinich/Sinigo Storage (treatment only)
+
 field_sampling_results[["Pfatten/Vadena_Storage"]]$permanova
 field_sampling_results[["Pfatten/Vadena_Storage"]]$permdisp_treatment
+
+# Sinich/Sinigo within Sampling
+field_sampling_results[["Sinich/Sinigo_Harvest"]]$permanova
+field_sampling_results[["Sinich/Sinigo_Harvest"]]$permdisp_treatment
+
 field_sampling_results[["Sinich/Sinigo_Storage"]]$permanova
 field_sampling_results[["Sinich/Sinigo_Storage"]]$permdisp_treatment
 
 
+saveRDS(
+  field_results,
+  "PERMANOVA_Aitchison_ExperimentalUnit_by_field.rds"
+)
 
-# 4) Ellipses -------------------------------------------------------------
-vegan_ellipse <- function(df, group_col, axes = c("CAP1","CAP2"), level = 0.68){
-  groups <- levels(df[[group_col]])
-  ellipses <- lapply(groups, function(g){
-    sub <- df[df[[group_col]]==g, axes]
+saveRDS(
+  field_sampling_results,
+  "PERMANOVA_Aitchison_ExperimentalUnit_field_sampling.rds"
+)
+
+# 4) Ordination ellipses -------------------------------------------------
+vegan_ellipse <- function(df, group_col, axes = c("CAP1", "CAP2"), level = 0.68) {
+  groups <- unique(df[[group_col]])
+  ellipses <- lapply(groups, function(g) {
+    sub <- df[df[[group_col]] == g, axes, drop = FALSE]
+    if (nrow(sub) < 3) return(NULL)
     cov_mat <- cov(sub)
     center <- colMeans(sub)
-    angles <- seq(0, 2*pi, length.out=100)
-    ellipse <- t(sapply(angles, function(theta){
+    angles <- seq(0, 2 * pi, length.out = 100)
+    ellipse <- t(sapply(angles, function(theta) {
       center + sqrt(qchisq(level, 2)) * t(chol(cov_mat)) %*% c(cos(theta), sin(theta))
     }))
     ellipse <- as.data.frame(ellipse)
@@ -685,12 +2987,23 @@ vegan_ellipse <- function(df, group_col, axes = c("CAP1","CAP2"), level = 0.68){
     colnames(ellipse)[1:2] <- axes
     ellipse
   })
-  do.call(rbind, ellipses)
+  bind_rows(ellipses)
 }
 
 dbrda_ellipses <- vegan_ellipse(dbrda_scores, group_col = "Sampling", level = 0.68)
 
-# PLOT --------------------------------------------------------------------
+dbrda_scores$Treatment <- dplyr::recode(
+  as.character(dbrda_scores$Treatment),
+  "Control" = "Control",
+  "Geoxe" = "Fludioxonil",
+  "Ulmasud" = "Acidic clays"
+)
+
+dbrda_scores$Treatment <- factor(
+  dbrda_scores$Treatment,
+  levels = c("Control", "Fludioxonil", "Acidic clays")
+)
+
 dbrda_plot <- ggplot(dbrda_scores, aes(x = CAP1, y = CAP2)) +
   geom_point(aes(color = Sampling, shape = Treatment), size = 3) +
   geom_path(
@@ -700,73 +3013,438 @@ dbrda_plot <- ggplot(dbrda_scores, aes(x = CAP1, y = CAP2)) +
     linetype = "dashed"
   ) +
   scale_color_manual(values = c(Harvest = "#E64B35", Storage = "#4DBBD5")) +
-  scale_shape_manual(values = 1:length(levels(meta$treatment))) +
-  labs(x = "CAP1", y = "CAP2", color = "Sampling", shape = "Treatment") +
-  facet_wrap(~ Field) +
-  theme_minimal(base_size = 14) +
+  scale_shape_manual(values = c(
+    "Control" = 16,
+    "Fludioxonil" = 17,
+    "Acidic clays" = 3
+  )) +
+  labs(
+    x = "CAP1",
+    y = "CAP2",
+    color = "Sampling",
+    shape = "Treatment",
+    subtitle = "Aitchison distance (CLR-transformed genus counts)"
+  ) +
+  facet_wrap(~Field) +
   theme_nature +
   theme(
     strip.text = element_blank(),
     strip.background = element_blank()
   )
 
-
-
 dbrda_plot_no_legend <- dbrda_plot + theme(legend.position = "none")
 dbrda_plot
 
+# ============================================================
+# 2) PCA OF CLR-TRANSFORMED ABUNDANCES
+# ============================================================
 
-# 5) combine with Shannon -------------------------------------------------
-p_shannon <- p_shannon +
-  theme(axis.title.x = element_blank())
-p_shannon
+# Samples x genera
+clr_samples <- t(clr_counts)
 
-# Combine RDA plots vertically
-# Remove legends explicitly from all plots before combining
-combined_plot_alpha_no_legend <- p_shannon + theme(legend.position = "none")
-dbrda_plot_no_legend <- dbrda_plot + theme(legend.position = "none")
-plot_combined_no_legend <- plot_grid(
-  combined_plot_alpha_no_legend,
+# PCA in CLR space
+# center = TRUE: standard PCA centering across samples
+# scale. = FALSE: do NOT rescale genera, as this would alter
+# Aitchison geometry
+pca_all <- stats::prcomp(
+  clr_samples,
+  center = TRUE,
+  scale. = FALSE
+)
+
+# Extract sample scores
+pca_scores <- as.data.frame(pca_all$x)
+
+# Add metadata in exactly the same sample order
+pca_scores$Sampling <- meta$sampling
+pca_scores$Treatment <- meta$treatment
+pca_scores$Field <- meta$field
+pca_scores$Block <- meta$block
+pca_scores$ExperimentalUnitID <- meta$ExperimentalUnitID
+
+# Percentage of variance explained
+pca_var <- 100 * pca_all$sdev^2 / sum(pca_all$sdev^2)
+
+PC1_lab <- paste0(
+  "PC1 (",
+  round(pca_var[1], 1),
+  "%)"
+)
+
+PC2_lab <- paste0(
+  "PC2 (",
+  round(pca_var[2], 1),
+  "%)"
+)
+
+
+# ============================================================
+# Treatment labels
+# ============================================================
+
+pca_scores <- pca_scores %>%
+  dplyr::mutate(
+    Treatment_label = dplyr::case_when(
+      
+      Field == "Pfatten/Vadena" &
+        Treatment == "Control" ~
+        "Control",
+      
+      Field == "Pfatten/Vadena" &
+        Treatment == "Geoxe" ~
+        "Fludioxonil",
+      
+      Field == "Pfatten/Vadena" &
+        Treatment == "Ulmasud" ~
+        "Acidic clays",
+      
+      Field == "Sinich/Sinigo" &
+        Treatment == "Control" ~
+        "Control",
+      
+      Field == "Sinich/Sinigo" &
+        Treatment == "Geoxe" ~
+        "Captan + Fludioxonil",
+      
+      Field == "Sinich/Sinigo" &
+        Treatment == "Ulmasud" ~
+        "Captan + Acidic clays",
+      
+      TRUE ~ as.character(Treatment)
+    ),
+    
+    Sampling = factor(
+      Sampling,
+      levels = c("Harvest", "Storage")
+    )
+  )
+
+
+# ============================================================
+# PCA plot
+# ============================================================
+
+pca_plot <- ggplot2::ggplot(
+  pca_scores,
+  ggplot2::aes(
+    x = PC1,
+    y = PC2,
+    color = Sampling,
+    shape = Treatment_label
+  )
+) +
+  
+  ggplot2::geom_point(
+    size = 3,
+    alpha = 0.8
+  ) +
+  
+  # Ellipses for sampling stage
+  ggplot2::stat_ellipse(
+    ggplot2::aes(
+      group = Sampling,
+      color = Sampling
+    ),
+    type = "t",
+    level = 0.68,
+    linewidth = 1,
+    linetype = "dashed",
+    show.legend = FALSE
+  ) +
+  
+  ggplot2::facet_wrap(
+    ~ Field
+  ) +
+  
+  ggplot2::scale_color_manual(
+    values = c(
+      Harvest = "#E64B35",
+      Storage = "#4DBBD5"
+    )
+  ) +
+  
+  ggplot2::labs(
+    x = PC1_lab,
+    y = PC2_lab,
+    color = "Sampling",
+    shape = "Treatment"
+  ) +
+  
+  theme_nature
+
+
+pca_plot
+
+legend_only <- cowplot::get_legend(
+  pca_plot +
+    ggplot2::theme(
+      legend.position = "right"
+    )
+)
+
+legend_only
+
+pca_plot_nolegend <- pca_plot +
+  ggplot2::theme(
+    legend.position = "none"
+  )
+
+pca_plot_nolegend
+
+# ============================================================================
+# 18. MAIN FIGURE -- SHANNON EFFECTIVE DIVERSITY
+# ============================================================================
+# Primary coverage-standardized alpha-diversity analysis.
+#
+# TD_q1 = Shannon effective diversity (Hill number q = 1).
+#
+# Delta is NOT calculated from the plotted raw/sample values.
+# Delta is the estimated marginal mean contrast from the primary mixed model:
+#
+#              Delta = Storage - Harvest
+#
+# Therefore:
+#   Delta > 0  -> higher diversity after storage
+#   Delta < 0  -> lower diversity after storage
+#
+# P-values shown are Holm-adjusted post-hoc P-values.
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# 1. Plot data
+# ----------------------------------------------------------------------------
+
+shannon_plot_data <- alpha_primary %>%
+  dplyr::select(
+    sam_name,
+    Field,
+    Sampling,
+    TD_q1
+  ) %>%
+  dplyr::filter(
+    !is.na(TD_q1)
+  ) %>%
+  dplyr::mutate(
+    Sampling = factor(
+      Sampling,
+      levels = c("Harvest", "Storage")
+    ),
+    Sampling_x = as.numeric(Sampling)
+  )
+
+
+# ----------------------------------------------------------------------------
+# 2. Post-hoc contrast used as effect size
+# ----------------------------------------------------------------------------
+
+shannon_posthoc <- stage_overall_all %>%
+  dplyr::filter(
+    Analysis == "Primary_coverage_standardized",
+    Metric == "TD_q1",
+    contrast == "Storage - Harvest"
+  ) %>%
+  dplyr::mutate(
+    
+    p_label = dplyr::case_when(
+      p.value.Holm < 0.001 ~ "p < 0.001",
+      TRUE ~ paste0(
+        "p = ",
+        formatC(
+          p.value.Holm,
+          format = "f",
+          digits = 3
+        )
+      )
+    ),
+    
+    label = paste0(
+      "\u0394 = ",
+      formatC(
+        estimate,
+        format = "f",
+        digits = 3
+      ),
+      "\n",
+      p_label
+    ),
+    
+    # Put annotation between Harvest and Storage
+    Sampling_x = 1.5
+  )
+
+
+# ----------------------------------------------------------------------------
+# 3. Figure
+# ----------------------------------------------------------------------------
+
+p_alpha_shannon <- ggplot2::ggplot(
+  shannon_plot_data,
+  ggplot2::aes(
+    x = Sampling_x,
+    y = TD_q1,
+    fill = Sampling,
+    color = Sampling
+  )
+) +
+  
+  # Violin distribution
+  ggplot2::geom_violin(
+    ggplot2::aes(
+      group = Sampling
+    ),
+    width = 0.75,
+    trim = FALSE,
+    alpha = 0.45,
+    linewidth = 0.5
+  ) +
+  
+  # Boxplot inside violin
+  ggplot2::geom_boxplot(
+    ggplot2::aes(
+      group = Sampling
+    ),
+    width = 0.16,
+    outlier.shape = NA,
+    alpha = 0.75,
+    linewidth = 0.5
+  ) +
+  
+  # Individual apples
+  ggplot2::geom_point(
+    position = ggplot2::position_jitter(
+      width = 0.08,
+      height = 0
+    ),
+    size = 1.7,
+    alpha = 0.65
+  ) +
+  
+  # Delta from EMM post-hoc contrast
+  ggplot2::geom_text(
+    data = shannon_posthoc,
+    ggplot2::aes(
+      x = Sampling_x,
+      y = Inf,
+      label = label
+    ),
+    inherit.aes = FALSE,
+    vjust = 1.15,
+    size = 3.6
+  ) +
+  
+  # One panel per field
+  ggplot2::facet_wrap(
+    ~ Field,
+    nrow = 1,
+    scales = "free_y"
+  ) +
+  
+  ggplot2::scale_x_continuous(
+    breaks = c(1, 2),
+    labels = c("Harvest", "Storage"),
+    limits = c(0.6, 2.4)
+  ) +
+  
+  ggplot2::scale_fill_manual(
+    values = c(
+      Harvest = "#E64B35",
+      Storage = "#4DBBD5"
+    )
+  ) +
+  
+  ggplot2::scale_color_manual(
+    values = c(
+      Harvest = "#E64B35",
+      Storage = "#4DBBD5"
+    )
+  ) +
+  
+  ggplot2::scale_y_continuous(
+    expand = ggplot2::expansion(
+      mult = c(0.05, 0.18)
+    )
+  ) +
+  
+  ggplot2::labs(
+    x = NULL,
+    y = "Shannon (q = 1)"
+  ) +
+  
+  theme_alpha +
+  
+  ggplot2::theme(
+    legend.position = "none",
+    
+    strip.text = ggplot2::element_text(
+      face = "bold",
+      size = 12
+    ),
+    
+    axis.text.x = ggplot2::element_text(
+      size = 10
+    ),
+    
+    axis.title.y = ggplot2::element_text(
+      size = 11
+    )
+  )
+
+
+print(p_alpha_shannon)
+
+p_alpha_shannon <- p_alpha_shannon + theme_nature + ggplot2::theme(
+  legend.position = "none")
+p_alpha_shannon
+
+
+# 5) Combine with Shannon ------------------------------------------------
+p_shannon <- p_shannon + theme(axis.title.x = element_blank())
+
+combined_plot <- plot_grid(
+  p_alpha_shannon,
+  pca_plot_nolegend,
+  nrow = 2,
+  labels = c(),
+  rel_heights = c(1.2, 1.8),
+  label_size = 15
+)
+
+combined_plot
+saveRDS(combined_plot, file = "combined_ITS_plot_reviewer_revised.rds")
+
+legend <- get_legend(dbrda_plot + theme(legend.position = "bottom"))
+saveRDS(legend, file = "combined_ITS_legend_reviewer_revised.rds")
+
+
+
+# 5) Combine with Shannon ------------------------------------------------
+p_shannon <- p_shannon + theme(axis.title.x = element_blank())
+
+combined_plot <- plot_grid(
+  p_shannon,
   dbrda_plot_no_legend,
   nrow = 2,
-  labels = c("b", "d"),
-  rel_heights = c(1.2, 1.8)
+  labels = c("a", "c"),
+  rel_heights = c(1.2, 1.8),
+  label_size = 15
 )
-plot_combined_no_legend
 
-# Read ITS plot and extract legend
-plot_combined_ITS <- readRDS("combined_ITS_plot.rds")
+combined_plot
+saveRDS(combined_plot, file = "combined_16S_plot_reviewer_revised.rds")
 
+legend <- get_legend(dbrda_plot + theme(legend.position = "bottom"))
+saveRDS(legend, file = "combined_16S_legend_reviewer_revised.rds")
 
-# Assume plot_combined_no_legend is your NMDS + RDA combined ggplot
-final_plot_aligned <- plot_grid(
-  plot_combined_ITS,
-  plot_combined_no_legend,
-  ncol = 2,
-  align = "hv",
-  label_size = 18
-)
-final_plot_aligned
-
-legend <- readRDS("combined_ITS_legend.rds")
-
-treatments <- readRDS("treatments.rds")
-
-final_plot_aligned <- plot_grid(
-  final_plot_aligned,
-  treatments,
-  legend,
-  ncol = 1,
-  rel_heights = c(0.5, 0.4, 0.02)
-)
-final_plot_aligned
-
+# ==============================
+# STEP 6: BETA PARTITIONING 
+# ==============================
 pseq.rel <- microbiome::transform(physeq_asv_filtered, "compositional")
 
 otu_pa <- as(otu_table(pseq.rel), "matrix")
 otu_pa <- 1 * (otu_pa > 0)
 
-if(taxa_are_rows(pseq.rel)) {
+if (taxa_are_rows(pseq.rel)) {
   otu_pa <- t(otu_pa)
 }
 
@@ -779,13 +3457,13 @@ beta_long_list <- list()
 fields <- unique(meta$field)
 treatments <- unique(meta$treatment)
 
-for(f in fields){
+for (f in fields) {
   
-  for(t in treatments){
+  for (t in treatments) {
     
     idx <- meta$field == f & meta$treatment == t
     
-    if(sum(idx) < 4) next
+    if (sum(idx) < 4) next
     
     otu_sub <- otu_pa[idx, ]
     meta_sub <- meta[idx, ]
@@ -807,14 +3485,14 @@ for(f in fields){
     S <- which(stage == "Storage")
     
     # remove diagonal comparisons
-    within_H <- beta_sor[H, H][upper.tri(beta_sor[H,H])]
-    within_S <- beta_sor[S, S][upper.tri(beta_sor[S,S])]
+    within_H <- beta_sor[H, H][upper.tri(beta_sor[H, H])]
+    within_S <- beta_sor[S, S][upper.tri(beta_sor[S, S])]
     
     between <- beta_sor[H, S]
     turnover <- beta_sim[H, S]
     nestedness <- beta_nes[H, S]
     
-    key <- paste(f,t,sep="_")
+    key <- paste(f, t, sep = "_")
     
     # ---------------------------
     # Summary values
@@ -834,30 +3512,34 @@ for(f in fields){
     # Mantel tests
     # ---------------------------
     
-    stage_numeric <- ifelse(stage=="Harvest",0,1)
+    stage_numeric <- ifelse(stage == "Harvest", 0, 1)
     stage_dist <- dist(stage_numeric)
     
-    mantel_sor <- mantel(beta$beta.sor, stage_dist, permutations=999)
-    mantel_sim <- mantel(beta$beta.sim, stage_dist, permutations=999)
-    mantel_nes <- mantel(beta$beta.sne, stage_dist, permutations=999)
+    mantel_sor <- mantel(beta$beta.sor, stage_dist, permutations = 999)
+    mantel_sim <- mantel(beta$beta.sim, stage_dist, permutations = 999)
+    mantel_nes <- mantel(beta$beta.sne, stage_dist, permutations = 999)
     
     mantel_list[[key]] <- data.frame(
       Field = f,
       Treatment = t,
-      Component = c("βSOR","βSIM","βNES"),
-      R = c(mantel_sor$statistic,
-            mantel_sim$statistic,
-            mantel_nes$statistic),
-      P_value = c(mantel_sor$signif,
-                  mantel_sim$signif,
-                  mantel_nes$signif)
+      Component = c("βSOR", "βSIM", "βNES"),
+      R = c(
+        mantel_sor$statistic,
+        mantel_sim$statistic,
+        mantel_nes$statistic
+      ),
+      P_value = c(
+        mantel_sor$signif,
+        mantel_sim$signif,
+        mantel_nes$signif
+      )
     )
     
     # ---------------------------
     # Extract pairwise distances
     # ---------------------------
     
-    extract_pairs <- function(mat, stage_vector, stage_name){
+    extract_pairs <- function(mat, stage_vector, stage_name) {
       
       idx_stage <- which(stage_vector == stage_name)
       vals <- mat[idx_stage, idx_stage]
@@ -870,19 +3552,18 @@ for(f in fields){
     }
     
     beta_long <- bind_rows(
-      extract_pairs(beta_sor, stage, "Harvest") %>% mutate(Component="βSOR"),
-      extract_pairs(beta_sim, stage, "Harvest") %>% mutate(Component="βSIM"),
-      extract_pairs(beta_nes, stage, "Harvest") %>% mutate(Component="βNES"),
-      extract_pairs(beta_sor, stage, "Storage") %>% mutate(Component="βSOR"),
-      extract_pairs(beta_sim, stage, "Storage") %>% mutate(Component="βSIM"),
-      extract_pairs(beta_nes, stage, "Storage") %>% mutate(Component="βNES")
+      extract_pairs(beta_sor, stage, "Harvest") %>% mutate(Component = "βSOR"),
+      extract_pairs(beta_sim, stage, "Harvest") %>% mutate(Component = "βSIM"),
+      extract_pairs(beta_nes, stage, "Harvest") %>% mutate(Component = "βNES"),
+      extract_pairs(beta_sor, stage, "Storage") %>% mutate(Component = "βSOR"),
+      extract_pairs(beta_sim, stage, "Storage") %>% mutate(Component = "βSIM"),
+      extract_pairs(beta_nes, stage, "Storage") %>% mutate(Component = "βNES")
     )
     
     beta_long$Field <- f
     beta_long$Treatment <- t
     
     beta_long_list[[key]] <- beta_long
-    
   }
 }
 
@@ -890,68 +3571,150 @@ beta_summary <- bind_rows(beta_summary_list)
 mantel_df <- bind_rows(mantel_list)
 beta_long_all <- bind_rows(beta_long_list)
 
+# -------------------------------------------------
+# Recode treatment labels for all plots
+# -------------------------------------------------
+beta_long_all <- beta_long_all %>%
+  mutate(
+    Treatment_label = case_when(
+      Field == "Pfatten/Vadena" & Treatment == "Control" ~ "Control",
+      Field == "Pfatten/Vadena" & Treatment == "Geoxe" ~ "Fludioxonil",
+      Field == "Pfatten/Vadena" & Treatment == "Ulmasud" ~ "Acidic Clays",
+      Field == "Sinich/Sinigo" & Treatment == "Control" ~ "Control",
+      Field == "Sinich/Sinigo" & Treatment == "Geoxe" ~ "Captan + Fludioxonil",
+      Field == "Sinich/Sinigo" & Treatment == "Ulmasud" ~ "Captan + Acidic Clays",
+      TRUE ~ Treatment
+    )
+  )
+
+mantel_df <- mantel_df %>%
+  mutate(
+    Treatment_label = case_when(
+      Field == "Pfatten/Vadena" & Treatment == "Control" ~ "Control",
+      Field == "Pfatten/Vadena" & Treatment == "Geoxe" ~ "Fludioxonil",
+      Field == "Pfatten/Vadena" & Treatment == "Ulmasud" ~ "Acidic Clays",
+      Field == "Sinich/Sinigo" & Treatment == "Control" ~ "Control",
+      Field == "Sinich/Sinigo" & Treatment == "Geoxe" ~ "Captan + Fludioxonil",
+      Field == "Sinich/Sinigo" & Treatment == "Ulmasud" ~ "Captan + Acidic Clays",
+      TRUE ~ Treatment
+    )
+  )
+
+beta_summary <- beta_summary %>%
+  mutate(
+    Treatment_label = case_when(
+      Field == "Pfatten/Vadena" & Treatment == "Control" ~ "Control",
+      Field == "Pfatten/Vadena" & Treatment == "Geoxe" ~ "Fludioxonil",
+      Field == "Pfatten/Vadena" & Treatment == "Ulmasud" ~ "Acidic Clays",
+      Field == "Sinich/Sinigo" & Treatment == "Control" ~ "Control",
+      Field == "Sinich/Sinigo" & Treatment == "Geoxe" ~ "Captan + Fludioxonil",
+      Field == "Sinich/Sinigo" & Treatment == "Ulmasud" ~ "Captan + Acidic Clays",
+      TRUE ~ Treatment
+    )
+  )
+
+# -------------------------------------------------
+# Keep facet order
+# -------------------------------------------------
+treatment_levels <- c(
+  "Control",
+  "Fludioxonil",
+  "Acidic Clays",
+  "Captan + Fludioxonil",
+  "Captan + Acidic Clays"
+)
+
+beta_long_all$Treatment_label <- factor(
+  beta_long_all$Treatment_label,
+  levels = treatment_levels
+)
+
+mantel_df$Treatment_label <- factor(
+  mantel_df$Treatment_label,
+  levels = treatment_levels
+)
+
+beta_summary$Treatment_label <- factor(
+  beta_summary$Treatment_label,
+  levels = treatment_levels
+)
+
 beta_means <- beta_long_all %>%
-  group_by(Field, Treatment, Component, Stage) %>%
-  summarise(Value = mean(Value, na.rm=TRUE), .groups="drop")
+  group_by(Field, Treatment, Treatment_label, Component, Stage) %>%
+  summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop")
+
 beta_means
+
 mantel_labels <- mantel_df %>%
   mutate(
     label = paste0(
-      "R = ", round(R,2),
-      "\np = ", signif(P_value,2)
+      "R = ", round(R, 2),
+      "\np = ", signif(P_value, 2)
     )
   )
 
 label_positions <- beta_long_all %>%
-  group_by(Field,Treatment,Component) %>%
+  group_by(Field, Treatment, Treatment_label, Component) %>%
   summarise(
-    Stage="Storage",
-    Value=max(Value,na.rm=TRUE)*0.95,
-    .groups="drop"
+    Stage = "Storage",
+    Value = max(Value, na.rm = TRUE) * 0.95,
+    .groups = "drop"
   )
 
-mantel_labels <- dplyr::left_join(mantel_labels,label_positions,
-                                  by=c("Field","Treatment","Component"))
+mantel_labels <- dplyr::left_join(
+  mantel_labels,
+  label_positions,
+  by = c("Field", "Treatment", "Treatment_label", "Component")
+)
 
 p_beta <- ggplot(beta_long_all, aes(Stage, Value)) +
   
-  geom_jitter(aes(color=Stage),
-              width=0.08,
-              alpha=0.35,
-              size=1.5) +
+  geom_jitter(
+    aes(color = Stage),
+    width = 0.08,
+    alpha = 0.35,
+    size = 1.5
+  ) +
   
-  geom_line(data=beta_means,
-            aes(group=interaction(Field,Treatment,Component)),
-            linewidth=1.1,
-            color="black") +
+  geom_line(
+    data = beta_means,
+    aes(group = interaction(Field, Treatment, Component)),
+    linewidth = 1.1,
+    color = "black"
+  ) +
   
-  geom_point(data=beta_means,
-             size=4,
-             shape=21,
-             fill="white",
-             color="black",
-             stroke=1.2) +
+  geom_point(
+    data = beta_means,
+    size = 4,
+    shape = 21,
+    fill = "white",
+    color = "black",
+    stroke = 1.2
+  ) +
   
-  geom_text(data=mantel_labels,
-            aes(Stage, Value, label=label),
-            inherit.aes=FALSE,
-            size=3.5,
-            fontface="bold",
-            hjust=1) +
+  geom_text(
+    data = mantel_labels,
+    aes(Stage, Value, label = label),
+    inherit.aes = FALSE,
+    size = 3.5,
+    fontface = "bold",
+    hjust = 1
+  ) +
   
-  facet_grid(Field + Treatment ~ Component) +
+  facet_grid(Field + Treatment_label ~ Component, drop = TRUE) +
   
-  scale_color_manual(values=c(
-    Harvest="#E64B35",
-    Storage="#4DBBD5"
+  scale_color_manual(values = c(
+    Harvest = "#E64B35",
+    Storage = "#4DBBD5"
   )) +
   
   labs(
-    x=NULL,
-    y="Beta diversity"
+    x = NULL,
+    y = "Beta diversity"
   ) +
   
   theme_nature
+
 p_beta
 
 # Filter beta_long_all for βSIM component
@@ -960,7 +3723,7 @@ beta_sim_long <- beta_long_all %>%
 
 # Compute mean values per Field × Treatment × Stage
 beta_sim_means <- beta_sim_long %>%
-  group_by(Field, Treatment, Stage) %>%
+  group_by(Field, Treatment, Treatment_label, Stage) %>%
   summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop")
 
 # Prepare Mantel labels for βSIM only
@@ -972,18 +3735,18 @@ mantel_sim_labels <- mantel_df %>%
 
 # Position labels at 95% of max value per Field × Treatment
 label_positions <- beta_sim_long %>%
-  group_by(Field, Treatment) %>%
+  group_by(Field, Treatment, Treatment_label) %>%
   summarise(
     Stage = "Storage",
     Value = max(Value, na.rm = TRUE) * 0.95,
     .groups = "drop"
   )
 
-mantel_sim_labels <- dplyr::left_join(mantel_sim_labels, label_positions, 
-                                      by = c("Field", "Treatment"))
-
-
-
+mantel_sim_labels <- dplyr::left_join(
+  mantel_sim_labels,
+  label_positions,
+  by = c("Field", "Treatment", "Treatment_label")
+)
 
 beta_pfatten <- beta_sim_long %>%
   dplyr::filter(Field == "Pfatten/Vadena")
@@ -993,7 +3756,6 @@ means_pfatten <- beta_sim_means %>%
 
 mantel_pfatten <- mantel_sim_labels %>%
   dplyr::filter(Field == "Pfatten/Vadena")
-
 
 p_beta_pfatten <- ggplot(beta_pfatten, aes(Stage, Value)) +
   
@@ -1025,20 +3787,14 @@ p_beta_pfatten <- ggplot(beta_pfatten, aes(Stage, Value)) +
     aes(Stage, Value, label = label),
     inherit.aes = FALSE,
     hjust = 1,
-    size = 3.5,
+    size = 7,
     fontface = "bold"
   ) +
   
   facet_wrap(
-    ~ Treatment,
+    ~ Treatment_label,
     nrow = 1,
-    labeller = labeller(
-      Treatment = c(
-        Control = "Control",
-        Geoxe = "Fludioxonil",
-        Ulmasud = "Plant fortifier"
-      )
-    )
+    drop = TRUE
   ) +
   
   scale_color_manual(values = c(
@@ -1049,13 +3805,13 @@ p_beta_pfatten <- ggplot(beta_pfatten, aes(Stage, Value)) +
   labs(
     title = "Pfatten/Vadena",
     x = NULL,
-    y = expression(beta[SIM]~"(turnover)")
+    y = expression(beta[SIM] ~ "(turnover)")
   ) +
   
   theme_nature +
   theme(
-    strip.text = element_text(face = "bold"),
-    plot.title = element_text(size = 14, face = "bold"),
+    strip.text = element_text(size = 16, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold"),
     legend.position = "none"
   )
 
@@ -1069,7 +3825,6 @@ means_sinich <- beta_sim_means %>%
 
 mantel_sinich <- mantel_sim_labels %>%
   dplyr::filter(Field == "Sinich/Sinigo")
-
 
 p_beta_sinich <- ggplot(beta_sinich, aes(Stage, Value)) +
   
@@ -1101,20 +3856,14 @@ p_beta_sinich <- ggplot(beta_sinich, aes(Stage, Value)) +
     aes(Stage, Value, label = label),
     inherit.aes = FALSE,
     hjust = 1,
-    size = 3.5,
+    size = 7,
     fontface = "bold"
   ) +
   
   facet_wrap(
-    ~ Treatment,
+    ~ Treatment_label,
     nrow = 1,
-    labeller = labeller(
-      Treatment = c(
-        Control = "Control",
-        Geoxe = "Captan + Fludioxonil",
-        Ulmasud = "Captan + Plant fortifier"
-      )
-    )
+    drop = TRUE
   ) +
   
   scale_color_manual(values = c(
@@ -1122,1125 +3871,3601 @@ p_beta_sinich <- ggplot(beta_sinich, aes(Stage, Value)) +
     Storage = "#4DBBD5"
   )) +
   
-  
   theme_nature +
   theme(
-    strip.text = element_text(face = "bold"),
-    plot.title = element_text(size = 14, face = "bold"),
+    strip.text = element_text(size = 16, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold"),
     legend.position = "none"
-  ) + labs(
+  ) +
+  labs(
     title = "Sinich/Sinigo",
     x = NULL,
-    y = NULL) +
+    y = NULL
+  ) +
   theme(
     axis.title.y = element_blank(),
     axis.text.y = element_blank(),
     axis.ticks.y = element_blank()
-  ) 
+  )
 
 p_beta_sinich
 
-p_beta_final <- p_beta_pfatten + p_beta_sinich + 
-  plot_layout(ncol = 2, guides = "collect") + 
+p_beta_final <- p_beta_pfatten + p_beta_sinich +
+  plot_layout(ncol = 2, guides = "collect") +
   theme(legend.position = "none")
 
 p_beta_final
 
-library(dplyr)
-library(ggplot2)
-library(patchwork)
-library(cowplot)
-library(forcats)
-library(tidyr)
-library(stringr)
-library(grid)
-
 # =========================================================
-# 1. Keep your existing betaSIM code and p_beta_final
-#    (already created above)
+# STEP 7: LEFSE
+# Harvest vs Storage within each Field x Treatment
+# CSS normalization performed INSIDE run_lefse()
 # =========================================================
 
+
 # =========================================================
-# 2. Build LEfSe summary table
+# SETTINGS
 # =========================================================
 
-fields_order <- c("Pfatten/Vadena", "Sinich/Sinigo")
-treatments_order <- c("Control", "Geoxe", "Ulmasud")
+fields_order <- c(
+  "Pfatten/Vadena",
+  "Sinich/Sinigo"
+)
+
+treatments_order <- c(
+  "Control",
+  "Geoxe",
+  "Ulmasud"
+)
 
 treatment_labels <- c(
   "Pfatten/Vadena__Control" = "Control",
   "Pfatten/Vadena__Geoxe"   = "Fludioxonil",
-  "Pfatten/Vadena__Ulmasud" = "Plant fortifier",
+  "Pfatten/Vadena__Ulmasud" = "Acidic Clays",
+  
   "Sinich/Sinigo__Control"  = "Control",
   "Sinich/Sinigo__Geoxe"    = "Captan + Fludioxonil",
-  "Sinich/Sinigo__Ulmasud"  = "Captan + Plant fortifier"
+  "Sinich/Sinigo__Ulmasud"  = "Captan + Acidic Clays"
 )
+
+
+# =========================================================
+# LEfSe PARAMETERS
+# =========================================================
+
+lefse_kw_cutoff <- 0.05
+lefse_wilcoxon_cutoff <- 0.05
+lefse_lda_cutoff <- 2
+
+lefse_bootstrap_n <- 100
+lefse_bootstrap_fraction <- 2/3
+lefse_sample_min <- 5
+
+
+# =========================================================
+# START FROM RAW COUNTS
+#
+# IMPORTANT:
+#
+# NO prevalence filtering
+# NO minimum abundance filtering
+# NO relative abundance transformation
+#
+# Only:
+#   1. subset Field x Treatment
+#   2. genus aggregation
+#   3. remove zero-total genera
+#   4. remove invariant genera
+#   5. CSS normalization inside run_lefse()
+#   6. Harvest vs Storage LEfSe
+# =========================================================
+
+ps_lefse <- physeq_asv_filtered
+
+
+# =========================================================
+# PREPARE METADATA
+# =========================================================
+
+meta_lefse <- as.data.frame(
+  phyloseq::sample_data(ps_lefse)
+)
+
+meta_lefse$sampling <- factor(
+  meta_lefse$sampling,
+  levels = c(
+    "Harvest",
+    "Storage"
+  )
+)
+
+meta_lefse$field <- factor(
+  meta_lefse$field,
+  levels = fields_order
+)
+
+meta_lefse$treatment <- factor(
+  meta_lefse$treatment,
+  levels = treatments_order
+)
+
+phyloseq::sample_data(ps_lefse) <-
+  phyloseq::sample_data(meta_lefse)
+
+
+# =========================================================
+# HELPER:
+# CONVERT microbiomeMarker marker_table TO NORMAL DATA FRAME
+#
+# marker_table is an S4 class inheriting from data.frame.
+# We explicitly extract its .Data slot so dplyr never
+# operates directly on the S4 object.
+# =========================================================
+
+marker_table_to_df <- function(mm) {
+  
+  mt_raw <- microbiomeMarker::marker_table(mm)
+  
+  mt <- base::as.data.frame(
+    methods::slot(
+      mt_raw,
+      ".Data"
+    ),
+    stringsAsFactors = FALSE
+  )
+  
+  colnames(mt) <- colnames(
+    mt_raw
+  )
+  
+  mt
+}
+
+
+# =========================================================
+# HELPER:
+# EXTRACT AND FORMAT LEfSe MARKERS
+# =========================================================
+
+extract_lefse_markers <- function(mm) {
+  
+  mt <- marker_table_to_df(
+    mm
+  )
+  
+  if (nrow(mt) == 0) {
+    
+    return(
+      tibble::tibble()
+    )
+  }
+  
+  
+  # -------------------------------------------------------
+  # Current microbiomeMarker source uses ef_lda.
+  # Keep compatibility with versions returning lda.
+  # -------------------------------------------------------
+  
+  lda_col <- intersect(
+    c(
+      "ef_lda",
+      "lda"
+    ),
+    colnames(mt)
+  )
+  
+  
+  if (length(lda_col) == 0) {
+    
+    stop(
+      "Could not find LEfSe LDA column. Available columns: ",
+      paste(
+        colnames(mt),
+        collapse = ", "
+      )
+    )
+  }
+  
+  
+  lda_col <- lda_col[1]
+  
+  
+  # -------------------------------------------------------
+  # p-value column
+  # -------------------------------------------------------
+  
+  p_col <- intersect(
+    c(
+      "pvalue",
+      "p_value",
+      "p.value"
+    ),
+    colnames(mt)
+  )
+  
+  
+  if (length(p_col) == 0) {
+    
+    stop(
+      "Could not find LEfSe p-value column. Available columns: ",
+      paste(
+        colnames(mt),
+        collapse = ", "
+      )
+    )
+  }
+  
+  
+  p_col <- p_col[1]
+  
+  
+  # -------------------------------------------------------
+  # Extract vectors BEFORE using dplyr
+  # -------------------------------------------------------
+  
+  feature_vec <- as.character(
+    mt[["feature"]]
+  )
+  
+  enriched_vec <- as.character(
+    mt[["enrich_group"]]
+  )
+  
+  lda_vec <- as.numeric(
+    mt[[lda_col]]
+  )
+  
+  p_vec <- as.numeric(
+    mt[[p_col]]
+  )
+  
+  
+  # -------------------------------------------------------
+  # Build completely new tibble
+  # -------------------------------------------------------
+  
+  out <- tibble::tibble(
+    
+    Taxon = feature_vec,
+    
+    Enriched = enriched_vec,
+    
+    LDA = abs(
+      lda_vec
+    ),
+    
+    Pvalue = p_vec
+  )
+  
+  
+  # -------------------------------------------------------
+  # Clean names + signed LDA
+  #
+  # Negative = Harvest
+  # Positive = Storage
+  # -------------------------------------------------------
+  
+  out <- out %>%
+    
+    dplyr::mutate(
+      
+      # Keep terminal taxonomy component if necessary
+      Taxon = sub(
+        "^.*\\|",
+        "",
+        Taxon
+      ),
+      
+      # Remove genus/rank prefix if present
+      Taxon = sub(
+        "^[A-Za-z]__",
+        "",
+        Taxon
+      ),
+      
+      # Previous name cleaning
+      Taxon = gsub(
+        "_gen_Incertae_sedis",
+        "",
+        Taxon,
+        fixed = TRUE
+      ),
+      
+      SignedLDA = dplyr::case_when(
+        
+        Enriched == "Harvest" ~
+          -LDA,
+        
+        Enriched == "Storage" ~
+          LDA,
+        
+        TRUE ~
+          NA_real_
+      )
+    ) %>%
+    
+    dplyr::select(
+      Taxon,
+      Enriched,
+      LDA,
+      SignedLDA,
+      Pvalue
+    )
+  
+  
+  return(out)
+}
+
+
+# =========================================================
+# STORAGE OBJECTS
+# =========================================================
 
 lefse_long_list <- list()
 
-for(f in fields_order){
-  for(t in treatments_order){
+lefse_models <- list()
+
+lefse_diagnostics_list <- list()
+
+
+# =========================================================
+# RUN SIX LEfSe COMPARISONS
+#
+# Pfatten/Vadena:
+#   Control              Harvest vs Storage
+#   Fludioxonil          Harvest vs Storage
+#   Acidic Clays         Harvest vs Storage
+#
+# Sinich/Sinigo:
+#   Control                  Harvest vs Storage
+#   Captan + Fludioxonil     Harvest vs Storage
+#   Captan + Acidic Clays    Harvest vs Storage
+# =========================================================
+
+set.seed(423542)
+
+
+for (f in fields_order) {
+  
+  for (trt in treatments_order) {
     
-    key <- paste(f, t, sep = "_")
     
-    tse_treat <- tse__fresh[, tse__fresh$field == f & tse__fresh$treatment == t]
-    if(ncol(tse_treat) < 3) next
+    # -----------------------------------------------------
+    # Unique result key
+    # -----------------------------------------------------
     
-    tse_genus <- agglomerateByRank(tse_treat, rank = "Genus", update.tree = TRUE)
-    
-    keep_var <- apply(assay(tse_genus), 1, var) > 0
-    tse_genus <- tse_genus[keep_var, ]
-    if(nrow(tse_genus) == 0) next
-    
-    prevalence <- rowSums(assay(tse_genus) > 0) / ncol(tse_genus)
-    tse_genus <- tse_genus[prevalence >= 0.7, ]
-    if(nrow(tse_genus) == 0) next
-    
-    tse_ra <- relativeAb(tse_genus)
-    max_abund <- apply(assay(tse_ra), 1, max)
-    tse_ra <- tse_ra[max_abund >= 0.001, ]
-    if(nrow(tse_ra) == 0) next
-    
-    tn <- get_terminal_nodes(rownames(tse_ra))
-    tse_final <- tse_ra[tn, ]
-    if(nrow(tse_final) == 0) next
-    
-    sampling_vals <- colData(tse_final)$sampling
-    valid <- !is.na(sampling_vals)
-    tse_final <- tse_final[, valid]
-    sampling_vals <- sampling_vals[valid]
-    
-    if(length(unique(sampling_vals)) < 2) next
-    
-    res_lefse <- tryCatch(
-      lefser(tse_final, classCol = "sampling"),
-      error = function(e) NULL
+    key <- paste(
+      f,
+      trt,
+      sep = "__"
     )
     
-    if(is.null(res_lefse) || nrow(res_lefse) == 0) next
     
-    res_lefse$features <- gsub("_gen_Incertae_sedis", "", res_lefse$features, fixed = TRUE)
+    trt_label <- unname(
+      treatment_labels[
+        paste(
+          f,
+          trt,
+          sep = "__"
+        )
+      ]
+    )
     
-    res_lefse <- res_lefse %>%
-      mutate(
-        Field = f,
-        Treatment = t,
-        TreatmentLabel = treatment_labels[paste(f, t, sep = "__")],
-        Enriched = ifelse(scores < 0, "Harvest", "Storage"),
-        LDA = abs(scores),
-        SignedLDA = ifelse(scores < 0, -abs(scores), abs(scores)),
-        Taxon = features
-      ) %>%
-      dplyr::select(Field, Treatment, TreatmentLabel, Taxon, Enriched, LDA, SignedLDA)
     
-    lefse_long_list[[key]] <- res_lefse
+    message("")
+    message(
+      "============================================================"
+    )
+    
+    message(
+      "LEfSe: ",
+      f,
+      " | ",
+      trt_label,
+      " | Harvest vs Storage"
+    )
+    
+    message(
+      "============================================================"
+    )
+    
+    
+    # =====================================================
+    # 1. SELECT FIELD x TREATMENT SAMPLES
+    # =====================================================
+    
+    meta_now <- as.data.frame(
+      phyloseq::sample_data(
+        ps_lefse
+      )
+    )
+    
+    
+    keep_samples <- (
+      as.character(meta_now$field) == f &
+        as.character(meta_now$treatment) == trt &
+        !is.na(meta_now$sampling)
+    )
+    
+    
+    keep_samples[
+      is.na(keep_samples)
+    ] <- FALSE
+    
+    
+    sample_ids <- rownames(
+      meta_now
+    )[
+      keep_samples
+    ]
+    
+    
+    if (length(sample_ids) < 2) {
+      
+      warning(
+        "Skipping ",
+        key,
+        ": too few samples."
+      )
+      
+      next
+    }
+    
+    
+    ps_sub <- phyloseq::prune_samples(
+      sample_ids,
+      ps_lefse
+    )
+    
+    
+    # Remove taxa completely absent from this subset
+    ps_sub <- phyloseq::prune_taxa(
+      phyloseq::taxa_sums(ps_sub) > 0,
+      ps_sub
+    )
+    
+    
+    # =====================================================
+    # 2. SAMPLING FACTOR
+    # =====================================================
+    
+    sd_sub <- as.data.frame(
+      phyloseq::sample_data(
+        ps_sub
+      )
+    )
+    
+    
+    sd_sub$sampling <- droplevels(
+      factor(
+        sd_sub$sampling,
+        levels = c(
+          "Harvest",
+          "Storage"
+        )
+      )
+    )
+    
+    
+    phyloseq::sample_data(ps_sub) <-
+      phyloseq::sample_data(
+        sd_sub
+      )
+    
+    
+    message(
+      "Samples:"
+    )
+    
+    
+    print(
+      table(
+        sd_sub$sampling
+      )
+    )
+    
+    
+    # Must contain exactly Harvest + Storage
+    if (
+      nlevels(sd_sub$sampling) != 2
+    ) {
+      
+      warning(
+        "Skipping ",
+        key,
+        ": Harvest and Storage are not both represented."
+      )
+      
+      next
+    }
+    
+    
+    # =====================================================
+    # 3. AGGLOMERATE RAW COUNTS TO GENUS
+    # =====================================================
+    
+    ps_genus <- phyloseq::tax_glom(
+      
+      ps_sub,
+      
+      taxrank = "Genus",
+      
+      NArm = TRUE
+    )
+    
+    
+    # Remove zero-total genera
+    ps_genus <- phyloseq::prune_taxa(
+      
+      phyloseq::taxa_sums(
+        ps_genus
+      ) > 0,
+      
+      ps_genus
+    )
+    
+    
+    if (
+      phyloseq::ntaxa(ps_genus) == 0
+    ) {
+      
+      warning(
+        "Skipping ",
+        key,
+        ": no genera after taxonomic aggregation."
+      )
+      
+      next
+    }
+    
+    
+    # =====================================================
+    # 4. KEEP CLEAN GENUS LABELS, BUT USE UNIQUE INTERNAL IDS
+    #
+    # tax_glom() can leave more than one feature with the same
+    # displayed Genus label when higher-rank taxonomy differs.
+    # microbiomeMarker requires unique taxa_names(), so DO NOT
+    # rename taxa_names() directly to duplicated genus labels.
+    #
+    # Instead:
+    #   - keep Genus in the standard taxonomy table;
+    #   - assign unique internal FeatureID values to taxa_names();
+    #   - restore the genus label after LEfSe using a lookup table.
+    #
+    # Do NOT add FeatureID or Genus_display to tax_table().
+    # =====================================================
+    
+    tax_genus <- as.data.frame(
+      phyloseq::tax_table(
+        ps_genus
+      )
+    )
+    
+    
+    genus_names <- trimws(
+      as.character(
+        tax_genus$Genus
+      )
+    )
+    
+    
+    valid_genus <- (
+      !is.na(genus_names) &
+        genus_names != ""
+    )
+    
+    
+    ps_genus <- phyloseq::prune_taxa(
+      valid_genus,
+      ps_genus
+    )
+    
+    
+    tax_genus <- as.data.frame(
+      phyloseq::tax_table(
+        ps_genus
+      )
+    )
+    
+    
+    genus_names <- trimws(
+      as.character(
+        tax_genus$Genus
+      )
+    )
+    
+    
+    original_taxa_ids <- phyloseq::taxa_names(
+      ps_genus
+    )
+    
+    
+    feature_ids <- sprintf(
+      "GENUS_%05d",
+      seq_along(genus_names)
+    )
+    
+    
+    genus_lookup <- tibble::tibble(
+      FeatureID = feature_ids,
+      Genus = genus_names,
+      OriginalTaxonID = original_taxa_ids
+    )
+    
+    
+    n_duplicate_genus_labels <- sum(
+      duplicated(genus_names)
+    )
+    
+    
+    if (n_duplicate_genus_labels > 0L) {
+      
+      message(
+        "Duplicate displayed genus labels after tax_glom: ",
+        n_duplicate_genus_labels,
+        ". Retaining them with unique internal FeatureID values."
+      )
+    }
+    
+    
+    phyloseq::taxa_names(
+      ps_genus
+    ) <- feature_ids
+    
+    
+    stopifnot(
+      !anyDuplicated(
+        phyloseq::taxa_names(
+          ps_genus
+        )
+      )
+    )
+    
+    
+    message(
+      "Genera before invariant filtering: ",
+      phyloseq::ntaxa(
+        ps_genus
+      )
+    )
+    
+    
+    # =====================================================
+    # 5. EXTRACT RAW GENUS COUNTS
+    # =====================================================
+    
+    counts_genus <- as(
+      phyloseq::otu_table(
+        ps_genus
+      ),
+      "matrix"
+    )
+    
+    
+    if (
+      !phyloseq::taxa_are_rows(
+        ps_genus
+      )
+    ) {
+      
+      counts_genus <- t(
+        counts_genus
+      )
+    }
+    
+    
+    # =====================================================
+    # 6. REMOVE INVARIANT GENERA
+    #
+    # ONLY filtering step beyond removal of zero-total taxa.
+    #
+    # NO prevalence filter
+    # NO minimum abundance filter
+    # =====================================================
+    
+    keep_var <- apply(
+      
+      counts_genus,
+      
+      1,
+      
+      function(x) {
+        
+        length(
+          unique(x)
+        ) > 1
+      }
+    )
+    
+    
+    keep_var[
+      is.na(keep_var)
+    ] <- FALSE
+    
+    
+    n_invariant <- sum(
+      !keep_var
+    )
+    
+    
+    message(
+      "Invariant genera removed: ",
+      n_invariant
+    )
+    
+    
+    ps_genus <- phyloseq::prune_taxa(
+      
+      keep_var,
+      
+      ps_genus
+    )
+    
+    
+    if (
+      phyloseq::ntaxa(
+        ps_genus
+      ) == 0
+    ) {
+      
+      warning(
+        "Skipping ",
+        key,
+        ": all genera were invariant."
+      )
+      
+      next
+    }
+    
+    
+    message(
+      "Genera entering LEfSe: ",
+      phyloseq::ntaxa(
+        ps_genus
+      )
+    )
+    
+    
+    # =====================================================
+    # 7. RUN LEfSe
+    #
+    # group = sampling
+    #
+    # Therefore the ONLY comparison here is:
+    #
+    #       Harvest vs Storage
+    #
+    # within the current Field x Treatment.
+    #
+    # Raw counts enter the function.
+    #
+    # CSS normalization occurs INSIDE run_lefse().
+    #
+    # taxa_rank = "none":
+    # object is already genus-agglomerated.
+    # =====================================================
+    
+    res_lefse <- tryCatch(
+      
+      microbiomeMarker::run_lefse(
+        
+        ps =
+          ps_genus,
+        
+        group =
+          "sampling",
+        
+        subgroup =
+          NULL,
+        
+        taxa_rank =
+          "none",
+        
+        transform =
+          "identity",
+        
+        # -----------------------------------------------
+        # CSS NORMALIZATION INSIDE LEfSe
+        # -----------------------------------------------
+        
+        norm =
+          "CSS",
+        
+        norm_para =
+          list(),
+        
+        # -----------------------------------------------
+        # LEfSe thresholds
+        # -----------------------------------------------
+        
+        kw_cutoff =
+          lefse_kw_cutoff,
+        
+        wilcoxon_cutoff =
+          lefse_wilcoxon_cutoff,
+        
+        lda_cutoff =
+          lefse_lda_cutoff,
+        
+        bootstrap_n =
+          lefse_bootstrap_n,
+        
+        bootstrap_fraction =
+          lefse_bootstrap_fraction,
+        
+        sample_min =
+          lefse_sample_min,
+        
+        # Two groups only
+        multigrp_strat =
+          FALSE,
+        
+        strict =
+          "0",
+        
+        only_same_subgrp =
+          FALSE,
+        
+        curv =
+          FALSE
+      ),
+      
+      
+      error = function(e) {
+        
+        warning(
+          "LEfSe failed for ",
+          key,
+          ": ",
+          conditionMessage(e)
+        )
+        
+        NULL
+      }
+    )
+    
+    
+    if (
+      is.null(res_lefse)
+    ) {
+      
+      next
+    }
+    
+    
+    # =====================================================
+    # 8. SAVE FULL microbiomeMarker OBJECT
+    # =====================================================
+    
+    lefse_models[[key]] <- res_lefse
+    
+    
+    # =====================================================
+    # 9. EXTRACT SIGNIFICANT MARKERS
+    # =====================================================
+    
+    marker_i <- extract_lefse_markers(
+      res_lefse
+    )
+    
+    
+    # Restore displayed genus labels from the unique internal IDs.
+    # The lookup remains outside tax_table(), so microbiomeMarker
+    # only sees standard taxonomic ranks.
+    if (nrow(marker_i) > 0L) {
+      
+      marker_i <- marker_i %>%
+        
+        dplyr::left_join(
+          genus_lookup %>%
+            dplyr::select(
+              FeatureID,
+              Genus
+            ),
+          by = c(
+            "Taxon" = "FeatureID"
+          )
+        ) %>%
+        
+        dplyr::mutate(
+          Taxon = dplyr::coalesce(
+            Genus,
+            Taxon
+          )
+        ) %>%
+        
+        dplyr::select(
+          -Genus
+        )
+    }
+    
+    
+    message(
+      "Significant LEfSe markers: ",
+      nrow(marker_i)
+    )
+    
+    
+    if (
+      nrow(marker_i) == 0
+    ) {
+      
+      next
+    }
+    
+    
+    # =====================================================
+    # 10. SAFETY CHECK
+    #
+    # Enriched group MUST ONLY be Harvest / Storage.
+    # =====================================================
+    
+    unexpected_groups <- setdiff(
+      
+      unique(
+        marker_i$Enriched
+      ),
+      
+      c(
+        "Harvest",
+        "Storage"
+      )
+    )
+    
+    
+    if (
+      length(unexpected_groups) > 0
+    ) {
+      
+      stop(
+        
+        "Unexpected LEfSe enriched groups in ",
+        key,
+        ": ",
+        paste(
+          unexpected_groups,
+          collapse = ", "
+        )
+      )
+    }
+    
+    
+    # =====================================================
+    # 11. ADD FIELD / TREATMENT INFORMATION
+    # =====================================================
+    
+    marker_i <- marker_i %>%
+      
+      dplyr::mutate(
+        
+        Field =
+          f,
+        
+        Treatment =
+          trt,
+        
+        TreatmentLabel =
+          trt_label,
+        
+        .before =
+          1
+      )
+    
+    
+    lefse_long_list[[key]] <- marker_i
+    
+    
+    # =====================================================
+    # 12. DIAGNOSTIC TABLE
+    # =====================================================
+    
+    lefse_diagnostics_list[[key]] <- tibble::tibble(
+      
+      Field =
+        f,
+      
+      Treatment =
+        trt,
+      
+      TreatmentLabel =
+        trt_label,
+      
+      Harvest_n =
+        sum(
+          sd_sub$sampling ==
+            "Harvest"
+        ),
+      
+      Storage_n =
+        sum(
+          sd_sub$sampling ==
+            "Storage"
+        ),
+      
+      GeneraBeforeInvariant =
+        phyloseq::ntaxa(
+          ps_genus
+        ) +
+        n_invariant,
+      
+      InvariantRemoved =
+        n_invariant,
+      
+      GeneraEnteringLEfSe =
+        phyloseq::ntaxa(
+          ps_genus
+        ),
+      
+      SignificantMarkers =
+        nrow(
+          marker_i
+        )
+    )
   }
 }
 
-lefse_long <- bind_rows(lefse_long_list)
 
 # =========================================================
-# 3. Keep strongest taxa per field separately
+# COMBINE RESULTS FROM SIX LEfSe RUNS
+# =========================================================
+
+lefse_long <- dplyr::bind_rows(
+  lefse_long_list
+)
+
+
+lefse_diagnostics <- dplyr::bind_rows(
+  lefse_diagnostics_list
+)
+
+
+# =========================================================
+# CHECK THE ALGORITHM
+#
+# This MUST return only:
+# Harvest
+# Storage
+# =========================================================
+
+print(
+  unique(
+    lefse_long$Enriched
+  )
+)
+
+
+if (
+  !all(
+    unique(
+      lefse_long$Enriched
+    ) %in%
+    c(
+      "Harvest",
+      "Storage"
+    )
+  )
+) {
+  
+  stop(
+    "LEfSe result contains groups other than Harvest/Storage."
+  )
+}
+
+
+# =========================================================
+# CHECK ALL SIX FIELD x TREATMENT COMPARISONS
+# =========================================================
+
+print(
+  lefse_diagnostics
+)
+
+
+print(
+  lefse_long %>%
+    
+    dplyr::count(
+      Field,
+      Treatment,
+      Enriched
+    )
+)
+
+
+# =========================================================
+# COMPLETE RESULTS
+# =========================================================
+
+lefse_long %>%
+  
+  dplyr::arrange(
+    
+    Field,
+    
+    Treatment,
+    
+    dplyr::desc(
+      LDA
+    )
+  ) %>%
+  
+  print(
+    n = Inf
+  )
+
+
+# =========================================================
+# EXPORT RESULTS
+# =========================================================
+
+openxlsx::write.xlsx(
+  
+  list(
+    
+    "LEfSe_markers" =
+      lefse_long,
+    
+    "Diagnostics" =
+      lefse_diagnostics
+  ),
+  
+  file =
+    "LEfSe_CSS_Harvest_vs_Storage.xlsx",
+  
+  overwrite =
+    TRUE
+)
+
+
+# =========================================================
+# FIGURE:
+# KEEP STRONGEST TAXA PER FIELD SEPARATELY
+#
+# This follows your ORIGINAL bubble-plot logic.
 # =========================================================
 
 top_taxa_field <- lefse_long %>%
-  group_by(Field, Taxon) %>%
-  summarise(maxLDA = max(abs(SignedLDA), na.rm = TRUE), .groups = "drop") %>%
-  group_by(Field) %>%
-  slice_max(order_by = maxLDA, n = 15, with_ties = FALSE) %>%
-  ungroup()
+  
+  dplyr::group_by(
+    Field,
+    Taxon
+  ) %>%
+  
+  dplyr::summarise(
+    
+    maxLDA =
+      max(
+        abs(
+          SignedLDA
+        ),
+        na.rm = TRUE
+      ),
+    
+    .groups =
+      "drop"
+  ) %>%
+  
+  dplyr::group_by(
+    Field
+  ) %>%
+  
+  dplyr::slice_max(
+    
+    order_by =
+      maxLDA,
+    
+    n =
+      15,
+    
+    with_ties =
+      FALSE
+  ) %>%
+  
+  dplyr::ungroup()
+
 
 lefse_top <- lefse_long %>%
-  semi_join(top_taxa_field, by = c("Field", "Taxon"))
-
-# =========================================================
-# 4. Complete field × treatment × taxon combinations
-#    using the top taxa chosen separately for each field
-# =========================================================
-
-plot_grid <- expand.grid(
-  Field = fields_order,
-  Treatment = treatments_order,
-  stringsAsFactors = FALSE
-) %>%
-  dplyr::left_join(
-    top_taxa_field %>% dplyr::select(Field, Taxon),
-    by = "Field"
-  ) %>%
-  mutate(
-    TreatmentLabel = treatment_labels[paste(Field, Treatment, sep = "__")]
-  )
-
-lefse_plot_df <- plot_grid %>%
-  dplyr::left_join(
-    lefse_top,
-    by = c("Field", "Treatment", "TreatmentLabel", "Taxon")
-  ) %>%
-  mutate(
-    Enriched = factor(Enriched, levels = c("Harvest", "Storage")),
-    LDA = ifelse(is.na(LDA), 0, LDA),
-    SignedLDA = ifelse(is.na(SignedLDA), 0, SignedLDA),
-    Taxon = str_replace_all(Taxon, "_", " "),
-    TreatmentLabel = case_when(
-      Field == "Pfatten/Vadena" & Treatment == "Control" ~ "Control",
-      Field == "Pfatten/Vadena" & Treatment == "Geoxe" ~ "Fludioxonil",
-      Field == "Pfatten/Vadena" & Treatment == "Ulmasud" ~ "Plant fortifier",
-      Field == "Sinich/Sinigo" & Treatment == "Control" ~ "Control",
-      Field == "Sinich/Sinigo" & Treatment == "Geoxe" ~ "Captan +\nFludioxonil",
-      Field == "Sinich/Sinigo" & Treatment == "Ulmasud" ~ "Captan +\nPlant fortifier",
-      TRUE ~ TreatmentLabel
+  
+  dplyr::semi_join(
+    
+    top_taxa_field,
+    
+    by = c(
+      "Field",
+      "Taxon"
     )
   )
 
+
 # =========================================================
-# 5. Shared taxon order across both fields
-#    This keeps common taxa on the same line
+# COMPLETE FIELD x TREATMENT x TAXON COMBINATIONS
+#
+# Empty cells indicate a genus was not significant
+# for that treatment.
+# =========================================================
+
+plot_grid <- expand.grid(
+  
+  Field =
+    fields_order,
+  
+  Treatment =
+    treatments_order,
+  
+  stringsAsFactors =
+    FALSE
+  
+) %>%
+  
+  dplyr::left_join(
+    
+    top_taxa_field %>%
+      
+      dplyr::select(
+        Field,
+        Taxon
+      ),
+    
+    by =
+      "Field"
+  ) %>%
+  
+  dplyr::mutate(
+    
+    TreatmentLabel =
+      unname(
+        treatment_labels[
+          paste(
+            Field,
+            Treatment,
+            sep = "__"
+          )
+        ]
+      )
+  )
+
+
+# =========================================================
+# JOIN LEfSe MARKERS
+# =========================================================
+
+lefse_plot_df <- plot_grid %>%
+  
+  dplyr::left_join(
+    
+    lefse_top,
+    
+    by = c(
+      "Field",
+      "Treatment",
+      "TreatmentLabel",
+      "Taxon"
+    )
+  ) %>%
+  
+  dplyr::mutate(
+    
+    Enriched = factor(
+      Enriched,
+      levels = c(
+        "Harvest",
+        "Storage"
+      )
+    ),
+    
+    # Only used for ordering.
+    # No bubble is drawn if Enriched is NA.
+    LDA = ifelse(
+      is.na(LDA),
+      0,
+      LDA
+    ),
+    
+    SignedLDA = ifelse(
+      is.na(SignedLDA),
+      0,
+      SignedLDA
+    ),
+    
+    Taxon =
+      stringr::str_replace_all(
+        Taxon,
+        "_",
+        " "
+      ),
+    
+    TreatmentLabel =
+      dplyr::case_when(
+        
+        Field == "Pfatten/Vadena" &
+          Treatment == "Control" ~
+          "Control",
+        
+        Field == "Pfatten/Vadena" &
+          Treatment == "Geoxe" ~
+          "Fludioxonil",
+        
+        Field == "Pfatten/Vadena" &
+          Treatment == "Ulmasud" ~
+          "Acidic Clays",
+        
+        Field == "Sinich/Sinigo" &
+          Treatment == "Control" ~
+          "Control",
+        
+        Field == "Sinich/Sinigo" &
+          Treatment == "Geoxe" ~
+          "Captan +\nFludioxonil",
+        
+        Field == "Sinich/Sinigo" &
+          Treatment == "Ulmasud" ~
+          "Captan +\nAcidic Clays",
+        
+        TRUE ~
+          TreatmentLabel
+      )
+  )
+
+
+# =========================================================
+# SHARED TAXON ORDER ACROSS BOTH FIELDS
+#
+# Common genera appear on exactly the same horizontal row.
 # =========================================================
 
 global_taxon_order <- lefse_plot_df %>%
-  group_by(Taxon) %>%
-  summarise(maxLDA = max(LDA, na.rm = TRUE), .groups = "drop") %>%
-  arrange(maxLDA) %>%
-  pull(Taxon)
-
-lefse_plot_df <- lefse_plot_df %>%
-  mutate(
-    Taxon = factor(Taxon, levels = global_taxon_order),
-    TreatmentLabel = factor(
-      TreatmentLabel,
-      levels = c(
-        "Control", "Fludioxonil", "Plant fortifier",
-        "Captan +\nFludioxonil", "Captan +\nPlant fortifier"
-      )
-    ),
-    Field = factor(Field, levels = c("Pfatten/Vadena", "Sinich/Sinigo"))
+  
+  dplyr::group_by(
+    Taxon
+  ) %>%
+  
+  dplyr::summarise(
+    
+    maxLDA =
+      max(
+        LDA,
+        na.rm = TRUE
+      ),
+    
+    .groups =
+      "drop"
+  ) %>%
+  
+  dplyr::arrange(
+    maxLDA
+  ) %>%
+  
+  dplyr::pull(
+    Taxon
   )
 
+
+lefse_plot_df <- lefse_plot_df %>%
+  
+  dplyr::mutate(
+    
+    Taxon =
+      factor(
+        Taxon,
+        levels =
+          global_taxon_order
+      ),
+    
+    TreatmentLabel =
+      factor(
+        
+        TreatmentLabel,
+        
+        levels = c(
+          "Control",
+          "Fludioxonil",
+          "Acidic Clays",
+          "Captan +\nFludioxonil",
+          "Captan +\nAcidic Clays"
+        )
+      ),
+    
+    Field =
+      factor(
+        Field,
+        levels =
+          fields_order
+      )
+  )
+
+
 # =========================================================
-# 6. Compact aligned bubble plot
+# COMPACT ALIGNED BUBBLE PLOT
+#
+# SAME VISUAL STRUCTURE AS YOUR ORIGINAL FIGURE
+#
+# x    = treatment
+# y    = genus
+# fill = Harvest / Storage
+# size = |LDA|
 # =========================================================
 
 p_lefse_bubble_aligned <- ggplot(
+  
   lefse_plot_df,
-  aes(x = TreatmentLabel, y = Taxon)
+  
+  aes(
+    x =
+      TreatmentLabel,
+    
+    y =
+      Taxon
+  )
+  
 ) +
+  
   geom_point(
-    data = lefse_plot_df %>% filter(!is.na(Enriched)),
-    aes(size = pmax(LDA, 2), fill = Enriched),
-    shape = 21,
-    color = "black",
-    stroke = 0.25,
-    alpha = 0.95
+    
+    data =
+      lefse_plot_df %>%
+      
+      dplyr::filter(
+        !is.na(
+          Enriched
+        )
+      ),
+    
+    aes(
+      
+      # Same scaling used in your original figure
+      size =
+        LDA^2,
+      
+      fill =
+        Enriched
+    ),
+    
+    shape =
+      21,
+    
+    color =
+      "black",
+    
+    stroke =
+      0.25,
+    
+    alpha =
+      0.95
   ) +
-  facet_grid(. ~ Field, scales = "free_x", space = "free_x") +
-  scale_y_discrete(drop = FALSE) +
+  
+  facet_grid(
+    
+    . ~ Field,
+    
+    scales =
+      "free_x",
+    
+    space =
+      "free_x"
+  ) +
+  
+  scale_y_discrete(
+    drop =
+      FALSE
+  ) +
+  
   scale_fill_manual(
-    values = c(Harvest = "#E64B35", Storage = "#4DBBD5"),
-    breaks = c("Harvest", "Storage"),
-    na.value = "transparent"
+    
+    values = c(
+      Harvest = "#E64B35",
+      Storage = "#4DBBD5"
+    ),
+    
+    breaks = c(
+      "Harvest",
+      "Storage"
+    ),
+    
+    na.value =
+      "transparent"
   ) +
+  
+  # LDA^2 mapping:
+  # 3 -> 9
+  # 4 -> 16
+  # 5 -> 25
   scale_size_continuous(
-    range = c(4, 12),
-    breaks = c(2, 3, 4, 5),
-    name = "|LDA|"
+    
+    range = c(
+      1.5,
+      15
+    ),
+    
+    breaks = c(
+      9,
+      16,
+      25
+    ),
+    
+    labels = c(
+      3,
+      4,
+      5
+    ),
+    
+    name =
+      "|LDA|"
   ) +
+  
   labs(
-    x = NULL,
-    y = NULL,
-    fill = "Enriched in",
-    size = "|LDA|"
+    
+    x =
+      NULL,
+    
+    y =
+      NULL,
+    
+    fill =
+      "Enriched in",
+    
+    size =
+      "|LDA|"
   ) +
+  
   theme_nature +
+  
   theme(
-    strip.text = element_blank(),
-    strip.background = element_blank(),
-    legend.position = "bottom",
-    legend.box = "horizontal"
+    
+    strip.text =
+      element_blank(),
+    
+    strip.background =
+      element_blank(),
+    
+    axis.text.x =
+      element_text(
+        size = 12,
+        angle = 0,
+        hjust = 0.5
+      ),
+    
+    axis.text.y =
+      element_text(
+        size = 12
+      ),
+    
+    panel.grid.major =
+      element_blank(),
+    
+    panel.grid.minor =
+      element_blank(),
+    
+    legend.position =
+      "bottom",
+    
+    legend.box =
+      "horizontal"
   )
 
+
 p_lefse_bubble_aligned
-top_taxa_field
+
+
 # =========================================================
-# 7. Final combined figure
+# SAVE LEfSe PANEL
 # =========================================================
+
+saveRDS(
+  
+  p_lefse_bubble_aligned,
+  
+  "LEfSe_CSS_faceted_bubble_plot.RDS"
+)
+
+
+ggsave(
+  
+  filename =
+    "LEfSe_CSS_faceted_bubble_plot.png",
+  
+  plot =
+    p_lefse_bubble_aligned,
+  
+  width =
+    7,
+  
+  height =
+    5,
+  
+  units =
+    "in",
+  
+  dpi =
+    600
+)
+
+
+# =========================================================
+# FINAL FIGURE 2
+#
+# a = beta turnover
+# b = LEfSe Harvest vs Storage
+# =========================================================
+
 p_beta_final <- p_beta_final &
+  
   theme(
-    strip.text = element_text(face = "bold", size = 11),
-    strip.background = element_blank(),
-    strip.placement = "outside"
+    
+    strip.text =
+      element_text(
+        face = "bold",
+        size = 16
+      ),
+    
+    strip.background =
+      element_blank(),
+    
+    strip.placement =
+      "outside"
   )
 
 
 p_final_combined <-
-  wrap_elements(p_beta_final) +
-  wrap_elements(p_lefse_bubble_aligned) +
-  plot_layout(ncol = 1, heights = c(0.32, 0.68)) +
-  plot_annotation(tag_levels = list(c("A", "B"))) &
+  
+  patchwork::wrap_elements(
+    p_beta_final
+  ) +
+  
+  patchwork::wrap_elements(
+    p_lefse_bubble_aligned
+  ) +
+  
+  patchwork::plot_layout(
+    
+    ncol =
+      1,
+    
+    heights = c(
+      0.32,
+      0.68
+    )
+  ) +
+  
+  patchwork::plot_annotation(
+    
+    tag_levels =
+      list(
+        c(
+          "a",
+          "b"
+        )
+      )
+  ) &
+  
   theme(
-    plot.tag = element_text(size = 12, face = "bold"),
-    plot.tag.position = c(0,1)
+    
+    plot.tag =
+      element_text(
+        size = 15,
+        face = "bold"
+      ),
+    
+    plot.tag.position =
+      c(
+        0,
+        1
+      )
   )
+
 
 p_final_combined
 
 
 # =========================================================
-# 8. Save
+# SAVE FINAL FIGURE
 # =========================================================
 
 ggsave(
-  "final_compact_manuscript_figure.png",
-  p_final_combined,
-  width = 7.0,
-  height = 6.2,
-  units = "in",
-  dpi = 300
-)
-
-# Print the custom plot
-print(p_custom_16s)
-p_ancombc2_16s <- p_ancombc2_16s + theme(
-  axis.title.x = element_blank(),        # remove y-axis title
-  axis.ticks.y = element_blank(),        # remove y-axis ticks
-  axis.line.y = element_line(color = "black")  # keep y-axis line
-) + theme(legend.position = "none")
-
-its_plot <- readRDS("p_ancombc2.rds")
-
-
-its_plot
-dumbell <- readRDS("dumbell.RDS")
-
-final_plot <- plot_grid(
-  # Top row: two plots
-  its_plot,
-  ncol = 1,
-  labels = c("A"),
-  label_size = 15,
-  label_fontface = "bold",
-  label_x = c(0.02, 0.02),
-  label_y = c(0.98, 0.98)
-) 
-
-# Add dumbell plot below spanning full width
-final_plot <- plot_grid(
-  final_plot,
-  dumbell,
-  ncol = 1,
-  rel_heights = c(2, 1),   # top row taller, bottom row standard
-  labels = c("", "B"),
-  label_size = 15,
-  label_fontface = "bold",
-  label_x = 0.02,
-  label_y = 0.98
-)
-final_plot
-
-# Step 11D:maaslin3 -------------------------------------------------------
-# We can specify different GLMs/normalizations/transforms.
-# Setting "Control" as the reference
-colData(tse_)$class <- factor(
-  colData(tse_)$class, 
-  levels = c("healthy", "light", "medium", "severe") # Set reference level first
-)
-colData(tse_)$treatment <- factor(
-  colData(tse_)$treatment, 
-  levels = c("Control", "Geoxe", "Ulmasud") # Set reference level first
-)
-maaslin3_out <- maaslin3(
-  input_data = tse_,              # Feature table
-  output = "maaslin3_output",           # Output directory
-  fixed_effects = c("class", "field", "treatment"),  # Main test + covariates
-  normalization = "TSS",                # Total sum scaling (default is OK)
-  transform = "LOG",                    # Log transform (default is OK)
-  correction = "BH",                    # Benjamini-Hochberg for multiple testing
-  standardize = TRUE,                   # Standardize variables
-  min_abundance = 0.01,                 # Optional: filter low-abundance features
-  min_prevalence = 0.1,                 # Optional: filter features found in <10% samples
-  max_significance = 0.05,              # More stringent FDR
-  plot_summary_plot = TRUE,
-  summary_plot_first_n = 25,
-  plot_associations = TRUE,
-  cores = 4,                          # Speed up with multicore if available
-  save_models = T,
-  save_plots_rds= T, 
-  heatmap_vars = c("class light",
-                   "class medium",
-                   "class severe"),
-  coef_plot_vars = c("class light",
-                     "class medium",
-                     "class severe")
-)
-
-maaslin3_out <- maaslin3_out[["fit_data_abundance"]][["results"]]
-maaslin3_out |>
-  filter(qval_joint <= 0.05) |>
-  kable()
-
-include_graphics("DAA_maaslin3/figures/summary_plot.png")
-
-# --- Step 1: Define target genera ---
-target_genera <- c(
-  "Rhodococcus",
-  "Agrococcus",
-  "Paenarthrobacter",
-  "Nocardioides",
-  "Variovorax",
-  "Paracoccus",
-  "Armatimonadales",
-  "Saccharimonadales",
-  "Asticcacaulis",
-  "Candidatus_Moranbacteria",
-  "Acidovorax",
-  "WD2101_soil_group",
-  "uncultured_55",
-  "Cavicella",
-  "Acidisoma",
-  "Oceanobacillus",
-  "Acidibacter",
-  "uncultured_101",
-  "AKYH767",
-  "Opitutus",
-  "Tumebacillus",
-  "Alistipes",
-  "Burkholderia-Caballeronia-Paraburkholderia",
-  "Leifsonia",
-  "Rhodococcus",
-  "Bifidobacterium",
-  "Pseudomonas",
-  "Escherichia-Shigella",
-  "Sphingomonas",
-  "Methylobacterium-Methylorubrum")
-
-scale_assay <- function(tse, format = c("lefse", "proportion", "percent")) {
-  format <- match.arg(format)
-  mat <- assay(tse)
   
-  mat <- switch(format,
-                lefse = apply(mat, 2, function(x) x / sum(x) * 1e6),
-                proportion = apply(mat, 2, function(x) x / sum(x)),
-                percent = apply(mat, 2, function(x) x / sum(x) * 100)
+  filename =
+    "final_compact_manuscript_figure_LEfSe_CSS.png",
+  
+  plot =
+    p_final_combined,
+  
+  width =
+    7.0,
+  
+  height =
+    6.2,
+  
+  units =
+    "in",
+  
+  dpi =
+    600
+)
+
+
+# =========================================================
+# STEP 8: COMMUNITY-ASSEMBLY NULL MODELLING WITH iCAMP
+# =========================================================
+# Reviewer L318/L389:
+# - DOC is no longer used as evidence for deterministic/stochastic assembly;
+# - iCAMP partitions assembly into heterogeneous selection (HeS),
+#   homogeneous selection (HoS), dispersal limitation (DL),
+#   homogenizing dispersal (HD), and drift (DR);
+# - bin-size diagnostics are evaluated explicitly;
+# - bins dominated by selection are mapped back to their ASVs/taxonomy.
+#
+# iCAMP documentation recommends exploring bin.size.limit values in roughly
+# the 12-48 range for real datasets. A formal ps.bin phylogenetic-signal test
+# additionally requires a meaningful numeric environmental/niche matrix.
+# Categorical Field/Treatment/Sampling labels are NOT converted to arbitrary
+# numbers for this purpose.
+# =========================================================
+
+prepare_icamp_data <- function(ps) {
+  comm <- get_sample_by_taxa_matrix(ps)
+  tree <- phyloseq::phy_tree(ps)
+  
+  common_taxa <- intersect(colnames(comm), tree$tip.label)
+  if (length(common_taxa) < 2L) {
+    stop("Too few taxa overlap between the community table and phylogeny.")
+  }
+  
+  comm <- comm[, common_taxa, drop = FALSE]
+  tree <- ape::keep.tip(tree, common_taxa)
+  
+  keep_taxa <- colSums(comm) > 0
+  comm <- comm[, keep_taxa, drop = FALSE]
+  tree <- ape::keep.tip(tree, colnames(comm))
+  
+  meta <- data.frame(phyloseq::sample_data(ps))
+  meta <- meta[rownames(comm), , drop = FALSE]
+  
+  taxonomy <- as.data.frame(phyloseq::tax_table(ps))
+  taxonomy <- taxonomy[colnames(comm), , drop = FALSE]
+  
+  list(
+    comm = comm,
+    tree = tree,
+    metadata = meta,
+    taxonomy = taxonomy
   )
-  
-  assay(tse) <- mat
-  return(tse)
 }
 
-tse_prop <- scale_assay(tse_lefse_ra, "proportion")  # 0–1 scale
-
-assay_mat <- assay(tse_prop)
-assay_targets <- assay_mat[rownames(assay_mat) %in% target_genera, , drop = FALSE]
-
-perc_mat <- assay_targets / colSums(assay_mat) * 100  # relative to total sample
-
-df <- perc_mat %>%
-  as.data.frame() %>%
-  rownames_to_column(var = "Genus") %>%
-  pivot_longer(
-    cols = -Genus,
-    names_to = "SampleID",
-    values_to = "Perc"
-  ) %>%
-  mutate(
-    Group = colData(tse_prop)[SampleID, "sampling"]
+run_icamp_bin_diagnostics <- function(
+    ps,
+    prefix = "16S",
+    bin_sizes = c(12L, 24L, 48L),
+    ds = 0.2,
+    nworker = 4L,
+    env_numeric = NULL,
+    abundance_cutoff = 3
+) {
+  x <- prepare_icamp_data(ps)
+  comm <- x$comm
+  tree <- x$tree
+  
+  outdir <- file.path(getwd(), paste0("iCAMP_", prefix, "_bin_diagnostics"))
+  pd_dir <- file.path(outdir, "phylogenetic_distance")
+  
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  dir.create(pd_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Compute the large phylogenetic-distance backing files once.
+  pd_big <- iCAMP::pdist.big(
+    tree = tree,
+    wd = pd_dir,
+    nworker = nworker
   )
-
-df_summary <- df %>%
-  group_by(Group, Genus) %>%
-  summarise(
-    mean_perc = mean(Perc, na.rm = TRUE),
-    median_perc = median(Perc, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-df_summary
-
-ggplot(df_summary, aes(x = Genus, y = Group, size = mean_perc, fill = Genus)) +
-  geom_point(shape = 21, color = "black") +  # circle with border
-  geom_text(aes(label = round(mean_perc, 1)), color = "black", size = 5, vjust = 0.5) +
-  scale_size_area(max_size = 15) +           # adjust bubble size
-  scale_fill_brewer(palette = "Set2") +
-  theme_minimal(base_size = 14) +
-  labs(x = "Genus", y = "", size = "Mean %", fill = "Genus") +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    axis.text.y = element_text(size = 12),
-    panel.grid = element_blank(),
-    legend.position = "bottom",
-    legend.title = element_text(size = 12)
-  )
-
-# DOC ---------------------------------------------------------------------
-# Transform to compositional 
-physeq <- physeq_asv_filtered
-physeq <- tax_glom(physeq, taxrank = "Genus")
-physeq <- prune_taxa(taxa_sums(physeq) > 100, physeq)
-physeq_rel <- microbiome::transform(physeq, "compositional")
-
-# --- Subset samples ---
-
-Harvest <- subset_samples(physeq_rel, sampling == "Harvest")
-Storage <- subset_samples(physeq_rel, sampling == "Storage")
-
-Harvest_none <- subset_samples(Harvest, treatment == "Control")
-Harvest_ulmasud <- subset_samples(Harvest, treatment == "Ulmasud")
-Harvest_geoxe <- subset_samples(Harvest, treatment == "Geoxe")
-
-Storage_none <- subset_samples(Storage, treatment == "Control")
-Storage_ulmasud <- subset_samples(Storage, treatment == "Ulmasud")
-Storage_geoxe <- subset_samples(Storage, treatment == "Geoxe")
-
-
-doc <- DOC(otu_table(physeq_rel), R =1000, iterations = 10, cores = 6)
-doc_Harvest <- DOC(otu_table(Harvest), R =1000, iterations = 10, cores = 6)  
-doc_Storage <- DOC(otu_table(Storage), R =1000, iterations = 10, cores = 6)  
-
-doc_Harvest_none <- DOC(otu_table(Harvest_none), R =1000, iterations = 10, cores = 6)  
-doc_Harvest_ulmasud <- DOC(otu_table(Harvest_ulmasud), R =1000, iterations = 10, cores = 6)  
-doc_Harvest_geoxe <- DOC(otu_table(Harvest_geoxe), R =1000, iterations = 10, cores = 6)  
-
-doc_Storage_none <- DOC(otu_table(Storage_none), R =1000, iterations = 10, cores = 6)  
-doc_Storage_ulmasud <- DOC(otu_table(Storage_ulmasud), R =1000, iterations = 10, cores = 6)  
-doc_Storage_geoxe <- DOC(otu_table(Storage_geoxe), R =1000, iterations = 10, cores = 6) 
-
-
-plot(doc_Harvest)
-plot(doc_Storage)
-
-results.null_Harvest <- DOC.null(otu_table(Harvest))
-results.null <- DOC.null(otu_table(Storage))
-
-# Inspect structure of doc objects returned by the package's DOC()
-str(doc_Harvest)
-str(doc_Storage)
-# Check DO and CI names
-head(doc_Harvest$DO)
-head(doc_Harvest$CI)
-names(doc_Harvest)
-
-analyze_DOC_combined_fromDOC <- function(doc1, doc2,
-                                         title1 = "Harvest", title2 = "Storage") {
-  # helper to find CI column names robustly
-  find_CI_cols <- function(CI) {
-    cn <- colnames(CI)
-    overlap_col <- if ("Overlap" %in% cn) "Overlap" else cn[1]
-    # try to find lower (2.5), median (50), upper (97.5)
-    lower_col <- cn[grep("2\\.5|2_5|2p5|X2\\.5", cn)[1]]
-    median_col <- cn[grep("(^|[^0-9])50([^0-9]|$)|X50|50\\.", cn)[1]]
-    upper_col <- cn[grep("97\\.5|97_5|97p5|X97\\.5", cn)[1]]
-    # fallbacks
-    if (is.na(lower_col) && length(cn) >= 2) lower_col <- cn[2]
-    if (is.na(median_col) && length(cn) >= 3) median_col <- cn[3]
-    if (is.na(upper_col) && length(cn) >= 4) upper_col <- cn[4]
-    list(overlap = overlap_col, lower = lower_col, median = median_col, upper = upper_col)
+  
+  structural_list <- list()
+  signal_list <- list()
+  
+  niche_diff <- NULL
+  
+  if (!is.null(env_numeric)) {
+    if (is.null(rownames(env_numeric))) {
+      stop("env_numeric must have sample IDs as row names.")
+    }
+    
+    if (!all(rownames(comm) %in% rownames(env_numeric))) {
+      stop("env_numeric does not contain all sample IDs in the community matrix.")
+    }
+    
+    env_numeric <- env_numeric[rownames(comm), , drop = FALSE]
+    
+    if (!all(vapply(env_numeric, is.numeric, logical(1)))) {
+      stop(
+        "env_numeric must contain meaningful numeric environmental variables. ",
+        "Do not recode Field/Treatment/Sampling factors to arbitrary integers."
+      )
+    }
+    
+    niche_dir <- file.path(outdir, "niche_distance")
+    dir.create(niche_dir, showWarnings = FALSE, recursive = TRUE)
+    
+    niche_diff <- iCAMP::dniche(
+      env = env_numeric,
+      comm = comm,
+      method = "niche.value",
+      nworker = nworker,
+      out.dist = FALSE,
+      bigmemo = TRUE,
+      nd.wd = niche_dir,
+      nd.spname.file = paste0(prefix, "_nd.names.csv")
+    )
   }
   
-  # safe extractor for metrics from a DOC object
-  extract_metrics_from_DOC <- function(doc_obj) {
-    # checks
-    if (is.null(doc_obj$DO)) stop("doc_obj has no DO component")
-    DO <- as.data.frame(doc_obj$DO)
-    CI <- if (!is.null(doc_obj$CI)) as.data.frame(doc_obj$CI) else NULL
-    LOW <- if (!is.null(doc_obj$LOWESS)) as.data.frame(doc_obj$LOWESS) else NULL
-    LME  <- if (!is.null(doc_obj$LME)) as.data.frame(doc_obj$LME) else NULL
-    NEG  <- if (!is.null(doc_obj$NEG)) as.data.frame(doc_obj$NEG) else NULL
-    FNS  <- if (!is.null(doc_obj$FNS)) as.data.frame(doc_obj$FNS) else NULL
+  for (bin_size in bin_sizes) {
+    message("\nTesting iCAMP bin.size.limit = ", bin_size)
     
-    # Oc: prefer median of NEG$Neg.Slope (bootstrap of Oc). fallback: compute from LOWY/LOWESS.
-    Oc <- NA_real_
-    if (!is.null(NEG)) {
-      # find any numeric column likely to be Neg.Slope
-      neg_col <- grep("Neg|neg|Oc|Oc\\.?|Neg.Slope", colnames(NEG), value = TRUE)[1]
-      if (!is.na(neg_col)) Oc <- median(NEG[[neg_col]], na.rm = TRUE)
-      else Oc <- median(unlist(NEG[, sapply(NEG, is.numeric), drop = FALSE]), na.rm = TRUE)
+    phylobin <- iCAMP::taxa.binphy.big(
+      tree = tree,
+      pd.desc = pd_big$pd.file,
+      pd.spname = pd_big$tip.label,
+      pd.wd = pd_big$pd.wd,
+      ds = ds,
+      bin.size.limit = bin_size,
+      nworker = nworker
+    )
+    
+    final_bin <- phylobin$sp.bin[, 3]
+    bin_counts <- table(final_bin)
+    
+    structural_list[[as.character(bin_size)]] <- tibble::tibble(
+      BinSizeLimit = bin_size,
+      N_bins = length(bin_counts),
+      Minimum_actual_bin_size = min(bin_counts),
+      Median_actual_bin_size = median(bin_counts),
+      Mean_actual_bin_size = mean(bin_counts),
+      Maximum_actual_bin_size = max(bin_counts)
+    )
+    
+    write.csv(
+      as.data.frame(phylobin$state.united),
+      file.path(
+        outdir,
+        paste0(prefix, "_bin_", bin_size, "_state_united.csv")
+      ),
+      row.names = FALSE
+    )
+    
+    # Formal within-bin phylogenetic-signal test, only if actual numeric
+    # environmental/niche variables are supplied.
+    if (!is.null(niche_diff)) {
+      sp_bin <- phylobin$sp.bin[, 3, drop = FALSE]
+      sp_ra <- colMeans(comm / rowSums(comm))
+      spname_use <- colnames(comm)[colSums(comm) >= abundance_cutoff]
       
-    } else if (!is.null(LOW)) {
-      lowx <- LOW[[1]]
+      ps_test <- iCAMP::ps.bin(
+        sp.bin = sp_bin,
+        sp.ra = sp_ra,
+        spname.use = spname_use,
+        pd.desc = pd_big$pd.file,
+        pd.spname = pd_big$tip.label,
+        pd.wd = pd_big$pd.wd,
+        nd.list = niche_diff$nd,
+        nd.spname = niche_diff$names,
+        ndbig.wd = niche_diff$nd.wd,
+        cor.method = "pearson",
+        r.cut = 0.01,
+        p.cut = 0.2,
+        min.spn = 6
+      )
       
-      # Detect LOWY or LOWESS column dynamically
-      lowy <- if (any(grepl("LOWY", colnames(LOW), ignore.case = TRUE))) {
-        LOW[[grep("LOWY", colnames(LOW), ignore.case = TRUE)]]
-      } else if (any(grepl("LOWESS", colnames(LOW), ignore.case = TRUE))) {
-        LOW[[grep("LOWESS", colnames(LOW), ignore.case = TRUE)]]
-      } else {
-        LOW[[2]]
-      }
+      signal_index <- as.data.frame(ps_test$Index) %>%
+        tibble::rownames_to_column("IndexRow") %>%
+        mutate(BinSizeLimit = bin_size, .before = 1)
       
-      # Smooth and compute slopes
-      ma5 <- stats::filter(lowy, rep(1/5, 5), sides = 2)
-      ma5[is.na(ma5)] <- lowy[is.na(ma5)]
-      svec <- diff(as.numeric(ma5)) / diff(as.numeric(lowx))
+      signal_list[[as.character(bin_size)]] <- signal_index
       
-      # Find where slope transitions from negative to non-negative (flattening)
-      neg_to_flat <- which(diff(sign(svec)) > 0)
-      if (length(neg_to_flat)) {
-        Oc <- as.numeric(lowx[neg_to_flat[1] + 1])
-      } else {
-        Oc <- max(lowx, na.rm = TRUE)  # fallback if always negative
+      if (!is.null(ps_test$detail)) {
+        write.csv(
+          as.data.frame(ps_test$detail),
+          file.path(
+            outdir,
+            paste0(prefix, "_bin_", bin_size, "_phylogenetic_signal_detail.csv")
+          ),
+          row.names = TRUE
+        )
       }
     }
-    
-    # fNS: prefer median of FNS$Fns
-    fNS_median <- if (!is.null(FNS)) {
-      fn_col <- grep("Fn|fn|FNS|Fns", colnames(FNS), value = TRUE)[1]
-      if (!is.na(fn_col)) median(FNS[[fn_col]], na.rm = TRUE) else median(unlist(FNS[, sapply(FNS, is.numeric), drop = FALSE]), na.rm = TRUE)
-    } else NA_real_
-    
-    # slopes: prefer LME$Slope
-    slope_median <- NA_real_; p_val <- NA_real_; slopes <- NULL
-    if (!is.null(LME)) {
-      slope_col <- grep("Slope|slope|beta", colnames(LME), value = TRUE)[1]
-      if (!is.na(slope_col)) {
-        slopes <- as.numeric(LME[[slope_col]])
-        slope_median <- median(slopes, na.rm = TRUE)
-        p_val <- mean(slopes >= 0, na.rm = TRUE)  # one-tailed per paper
-      } else {
-        numeric_cols <- unlist(LME[, sapply(LME, is.numeric), drop = FALSE])
-        slopes <- as.numeric(numeric_cols)
-        slope_median <- median(slopes, na.rm = TRUE)
-        p_val <- mean(slopes >= 0, na.rm = TRUE)
-      }
-    }
-    
-    # craft CI frame: ensure column names workable
-    CI_frame <- NULL
-    if (!is.null(CI)) {
-      cis <- find_CI_cols(CI)
-      CI_frame <- data.frame(Overlap = CI[[cis$overlap]],
-                             ymin = if (!is.na(cis$lower)) CI[[cis$lower]] else NA,
-                             y = if (!is.na(cis$median)) CI[[cis$median]] else NA,
-                             ymax = if (!is.na(cis$upper)) CI[[cis$upper]] else NA)
-    } else if (!is.null(LOW)) {
-      # create CI-like frame from LOWESS line if CI missing
-      CI_frame <- data.frame(Overlap = LOW[[1]],
-                             ymin = NA_real_, y = if ("LOWESS" %in% colnames(LOW)) LOW$LOWESS else LOW[[2]],
-                             ymax = NA_real_)
-    } else {
-      CI_frame <- data.frame(Overlap = DO$Overlap, ymin = NA_real_, y = NA_real_, ymax = NA_real_)
-    }
-    
-    list(DO = DO, CI = CI_frame, Oc = Oc, fNS_median = fNS_median,
-         slope_median = slope_median, p_value = p_val, slopes = slopes)
   }
   
-  m1 <- extract_metrics_from_DOC(doc1)
-  m2 <- extract_metrics_from_DOC(doc2)
+  structural <- bind_rows(structural_list)
+  signal <- bind_rows(signal_list)
   
-  # tag datasets
-  m1$DO$Dataset <- title1
-  m2$DO$Dataset <- title2
-  m1$CI$Dataset <- title1
-  m2$CI$Dataset <- title2
-  
-  combined_DO <- bind_rows(m1$DO, m2$DO)
-  combined_CI <- bind_rows(m1$CI, m2$CI)
-  
-  # densities scaled for x-axis
-  y_max <- max(combined_DO$rJSD, na.rm = TRUE)
-  density_scale <- if (is.finite(y_max) && y_max > 0) 0.15 * y_max else 0.15
-  densities <- combined_DO %>%
-    group_by(Dataset) %>%
-    do({
-      od <- .$Overlap
-      if (length(od) < 2 || all(is.na(od))) return(data.frame(x = numeric(0), y = numeric(0)))
-      dens <- stats::density(od, from = min(combined_DO$Overlap, na.rm = TRUE),
-                             to = max(combined_DO$Overlap, na.rm = TRUE))
-      data.frame(x = dens$x, y = dens$y / max(dens$y) * density_scale)
-    }) %>% ungroup()
-  
-  # colors (user can override)
-  col <- c(Harvest = "#F8766D", Storage = "#00BFC4")
-  if (!title1 %in% names(col)) col[title1] <- "#F8766D"
-  if (!title2 %in% names(col)) col[title2] <- "#00BFC4"
-  
-  # plotting using known CI column names (y, ymin, ymax)
-  p <- ggplot() +
-    geom_ribbon(data = combined_CI, aes(x = Overlap, ymin = ymin, ymax = ymax, fill = Dataset), alpha = 0.25) +
-    geom_line(data = combined_CI, aes(x = Overlap, y = y, color = Dataset), size = 1) +
-    geom_point(data = combined_DO, aes(x = Overlap, y = rJSD, color = Dataset), size = 0.8, alpha = 0.6) +
-    geom_vline(xintercept = m1$Oc, color = col[title1], linetype = "dashed") +
-    geom_vline(xintercept = m2$Oc, color = col[title2], linetype = "dashed") +
-    geom_area(data = densities, aes(x = x, y = y, fill = Dataset), alpha = 0.3, position = "identity") +
-    scale_color_manual(values = col, name = "Sampling") +  
-    scale_fill_manual(values = col, name = "Sampling") +    
-    theme_bw() + 
-    theme(panel.grid.major = element_blank(),
-          panel.grid.minor = element_blank(),
-          legend.position = "top") +
-    xlab("Overlap") + ylab("Dissimilarity (rJSD)") +
-    coord_cartesian(ylim = c(0, 1))
-  
-  # annotation text (robust formatting / NA safe)
-  fmt <- function(x, d = 2) if (is.na(x)) "NA" else formatC(x, digits = d, format = "f")
-  summary_text <- paste0(
-    sprintf("%s: Oc=%s | fNS=%s |  p=%s",
-            title1, fmt(m1$Oc), fmt(m1$fNS_median), fmt(m1$p_value)),
-    "\n",
-    sprintf("%s: Oc=%s | fNS=%s |  p=%s",
-            title2, fmt(m2$Oc), fmt(m2$fNS_median), fmt(m2$p_value))
+  write.csv(
+    structural,
+    file.path(outdir, paste0(prefix, "_bin_size_diagnostics.csv")),
+    row.names = FALSE
   )
   
-  p <- p + annotate("text",
-                    x = min(combined_DO$Overlap, na.rm = TRUE) + 0.02 * diff(range(combined_DO$Overlap, na.rm = TRUE)),
-                    y = 0.98, label = summary_text, hjust = 0, vjust = 1,
-                    size = 4, fontface = "bold", lineheight = 1.05)
+  if (nrow(signal) > 0) {
+    write.csv(
+      signal,
+      file.path(outdir, paste0(prefix, "_bin_phylogenetic_signal_summary.csv")),
+      row.names = FALSE
+    )
+  } else {
+    message(
+      "\nFormal ps.bin was not run because env_numeric = NULL. ",
+      "This is intentional: categorical experimental labels are not valid ",
+      "numeric niche distances. Structural bin-size diagnostics were exported."
+    )
+  }
   
-  print(p)
+  print(structural)
+  if (nrow(signal) > 0) print(signal)
   
-  return(list(metrics1 = m1, metrics2 = m2, plot = p))
+  list(
+    structural = structural,
+    phylogenetic_signal = signal,
+    pd_big = pd_big,
+    pd_dir = pd_dir,
+    output_dir = outdir
+  )
 }
 
-# assuming doc_Harvest and doc_Storage exist
-results_combined <- analyze_DOC_combined_fromDOC(doc_Harvest, doc_Storage,
-                                                 title1 = "Harvest", title2 = "Storage")
-results_16s <- results_combined$plot + theme_nature
-results_16s
-# ---- (1) package-level summaries ----
-summary_pkg <- list(
-  Oc_median_pkg  = median(doc_Harvest$NEG$Neg.Slope, na.rm = TRUE),
-  fNS_median_pkg = median(doc_Harvest$FNS$Fns, na.rm = TRUE),
-  slope_median_pkg = median(doc_Harvest$LME$Slope, na.rm = TRUE),
-  p_value_pkg = mean(doc_Harvest$LME$Slope >= 0, na.rm = TRUE)
-)
+# ============================================================
+# MEMORY-SAFE PATCH FOR iCAMP
+# Force RC.bin.bigc() to use sequential/loop storage
+# ============================================================
 
-summary_pkg
+RC_bin_bigc_original <- iCAMP::RC.bin.bigc
 
-# ---- (2) metrics from your combined analysis ----
-summary_new <- with(results_combined$metrics1,
-                    c(Oc = Oc, fNS = fNS_median,
-                      slope_median = slope_median, p = p_value))
-summary_new
-
-# ---- (3) compare numerically ----
-rbind(Package = summary_pkg, New_Function = summary_new)
-
-# ---- (1) package-level summaries ----
-summary_pkg_Storage <- list(
-  Oc_median_pkg  = median(doc_Storage$NEG$Neg.Slope, na.rm = TRUE),
-  fNS_median_pkg = median(doc_Storage$FNS$Fns, na.rm = TRUE),
-  slope_median_pkg = median(doc_Storage$LME$Slope, na.rm = TRUE),
-  p_value_pkg = mean(doc_Storage$LME$Slope >= 0, na.rm = TRUE)
-)
-
-summary_pkg_Storage
-
-# ---- (2) metrics from your combined analysis ----
-summary_new_Storage <- with(results_combined$metrics2,
-                            c(Oc = Oc, fNS = fNS_median,
-                              slope_median = slope_median, p = p_value))
-summary_new
-
-# ---- (3) compare numerically ----
-rbind(Package = summary_pkg_Storage, New_Function = summary_new_Storage)
-
-# Bootstrap check ---------------------------------------------------------
-
-par(mfrow = c(1,3))
-hist(doc_Harvest$NEG$Neg.Slope, main = "Bootstrap Oc (Harvest)",
-     xlab = "Oc", col = "skyblue")
-hist(doc_Harvest$FNS$Fns, main = "Bootstrap fNS (Harvest)",
-     xlab = "fNS", col = "lightgreen")
-hist(doc_Harvest$LME$Slope, main = "Bootstrap slopes (Harvest)",
-     xlab = "Slope", col = "lightcoral")
-
-par(mfrow = c(1,3))
-hist(doc_Storage$NEG$Neg.Slope, main = "Bootstrap Oc (Storage)",
-     xlab = "Oc", col = "skyblue")
-hist(doc_Storage$FNS$Fns, main = "Bootstrap fNS (Storage)",
-     xlab = "fNS", col = "lightgreen")
-hist(doc_Storage$LME$Slope, main = "Bootstrap slopes (Storage)",
-     xlab = "Slope", col = "lightcoral")
-
-head(results_combined$metrics1$CI)
-quantile(doc_Harvest$BOOT$rJSD.Boot.1, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)
-head(results_combined$metrics2$CI)
-quantile(doc_Storage$BOOT$rJSD.Boot.1, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)
-
-compare_DOC_distributions <- function(doc1, doc2,
-                                      title1 = "Harvest", title2 = "Storage",
-                                      method = "wilcox.test",
-                                      p.adjust.method = "BH") {
-  # helper to safely extract numeric bootstrap columns
-  safe_extract <- function(df, pattern) {
-    if (is.null(df)) return(NA_real_)
-    col <- grep(pattern, colnames(df), value = TRUE)[1]
-    if (is.na(col)) {
-      nums <- df[, sapply(df, is.numeric), drop = FALSE]
-      return(unlist(nums))
-    } else {
-      return(as.numeric(df[[col]]))
-    }
-  }
+RC_bin_bigc_memorysafe <- function(..., big.method = c("loop", "no")) {
   
-  # extract numeric vectors
-  Oc1 <- safe_extract(doc1$NEG, "Neg|Oc|Neg.Slope")
-  Oc2 <- safe_extract(doc2$NEG, "Neg|Oc|Neg.Slope")
-  
-  fNS1 <- safe_extract(doc1$FNS, "Fn|FNS")
-  fNS2 <- safe_extract(doc2$FNS, "Fn|FNS")
-  
-  slope1 <- safe_extract(doc1$LME, "Slope|slope|beta")
-  slope2 <- safe_extract(doc2$LME, "Slope|slope|beta")
-  
-  # define comparison function
-  cmp <- function(x, y, method) {
-    if (all(is.na(x)) || all(is.na(y))) return(NA_real_)
-    x <- x[is.finite(x)]
-    y <- y[is.finite(y)]
-    if (length(x) < 5 || length(y) < 5) return(NA_real_)
-    if (method == "wilcox.test") {
-      res <- try(stats::wilcox.test(x, y)$p.value, silent = TRUE)
-      if (inherits(res, "try-error")) return(NA_real_) else return(res)
-    } else if (method == "t.test") {
-      res <- try(stats::t.test(x, y)$p.value, silent = TRUE)
-      if (inherits(res, "try-error")) return(NA_real_) else return(res)
-    } else {
-      stop("Unsupported test method")
-    }
-  }
-  
-  # compute raw p-values
-  p_Oc <- cmp(Oc1, Oc2, method)
-  p_fNS <- cmp(fNS1, fNS2, method)
-  p_slope <- cmp(slope1, slope2, method)
-  
-  # multiple-testing correction
-  pvals <- c(p_Oc, p_fNS, p_slope)
-  padj <- stats::p.adjust(pvals, method = p.adjust.method)
-  
-  # summary table
-  results <- data.frame(
-    Metric = c("Oc", "fNS", "Slope"),
-    p_raw = signif(pvals, 3),
-    p_adj = signif(padj, 3),
-    Median_1 = c(median(Oc1, na.rm = TRUE),
-                 median(fNS1, na.rm = TRUE),
-                 median(slope1, na.rm = TRUE)),
-    Median_2 = c(median(Oc2, na.rm = TRUE),
-                 median(fNS2, na.rm = TRUE),
-                 median(slope2, na.rm = TRUE)),
-    Dataset_1 = title1,
-    Dataset_2 = title2
+  RC_bin_bigc_original(
+    ...,
+    big.method = "loop"
   )
-  
-  return(results)
 }
 
-comparison_results <- compare_DOC_distributions(doc_Harvest, doc_Storage,
-                                                title1 = "Harvest",
-                                                title2 = "Storage",
-                                                method = "wilcox.test",
-                                                p.adjust.method = "BH")
+assignInNamespace(
+  x = "RC.bin.bigc",
+  value = RC_bin_bigc_memorysafe,
+  ns = "iCAMP"
+)
 
-print(comparison_results)
+ICAMP_BIN_SIZE_16S <- 24L
+ICAMP_RAND <- 1000L
+ICAMP_WORKERS <- 4L
 
-analyze_DOC_multi_fromDOC <- function(doc_list, 
-                                      titles = c("Geoxe", "Control", "Ulmasud"),
-                                      phase = "Harvest") {
+run_icamp_reviewer <- function(
+    ps,
+    prefix = "16S",
+    bin_size = 24L,
+    rand = 1000L,
+    nworker = 4L,
+    ds = 0.2,
+    pd_big = NULL,
+    pd_dir = NULL
+) {
+  x <- prepare_icamp_data(ps)
+  comm <- x$comm
+  tree <- x$tree
+  meta <- x$metadata
+  taxonomy <- x$taxonomy
   
-  # ---- helper: robust CI column finder ----
-  find_CI_cols <- function(CI) {
-    cn <- colnames(CI)
-    overlap_col <- if ("Overlap" %in% cn) "Overlap" else cn[1]
-    lower_col <- cn[grep("2\\.5|2_5|2p5|X2\\.5", cn)[1]]
-    median_col <- cn[grep("(^|[^0-9])50([^0-9]|$)|X50|50\\.", cn)[1]]
-    upper_col <- cn[grep("97\\.5|97_5|97p5|X97\\.5", cn)[1]]
-    if (is.na(lower_col) && length(cn) >= 2) lower_col <- cn[2]
-    if (is.na(median_col) && length(cn) >= 3) median_col <- cn[3]
-    if (is.na(upper_col) && length(cn) >= 4) upper_col <- cn[4]
-    list(overlap = overlap_col, lower = lower_col, median = median_col, upper = upper_col)
+  outdir <- file.path(getwd(), paste0("iCAMP_results_", prefix))
+  if (is.null(pd_dir)) {
+    pd_dir <- file.path(outdir, "phylogenetic_distance")
   }
   
-  # ---- helper: metric extraction (exactly as your original) ----
-  extract_metrics_from_DOC <- function(doc_obj) {
-    DO <- as.data.frame(doc_obj$DO)
-    CI <- if (!is.null(doc_obj$CI)) as.data.frame(doc_obj$CI) else NULL
-    LOW <- if (!is.null(doc_obj$LOWESS)) as.data.frame(doc_obj$LOWESS) else NULL
-    LME  <- if (!is.null(doc_obj$LME)) as.data.frame(doc_obj$LME) else NULL
-    NEG  <- if (!is.null(doc_obj$NEG)) as.data.frame(doc_obj$NEG) else NULL
-    FNS  <- if (!is.null(doc_obj$FNS)) as.data.frame(doc_obj$FNS) else NULL
-    
-    # Oc: prefer NEG$Neg.Slope, fallback to LOWESS/LOWY
-    Oc <- NA_real_
-    if (!is.null(NEG)) {
-      neg_col <- grep("Neg|neg|Oc|Oc\\.?|Neg.Slope", colnames(NEG), value = TRUE)[1]
-      if (!is.na(neg_col)) Oc <- median(NEG[[neg_col]], na.rm = TRUE)
-      else Oc <- median(unlist(NEG[, sapply(NEG, is.numeric), drop = FALSE]), na.rm = TRUE)
-    } else if (!is.null(LOW)) {
-      lowx <- LOW[[1]]
-      lowy <- if (any(grepl("LOWY", colnames(LOW), ignore.case = TRUE))) {
-        LOW[[grep("LOWY", colnames(LOW), ignore.case = TRUE)]]
-      } else if (any(grepl("LOWESS", colnames(LOW), ignore.case = TRUE))) {
-        LOW[[grep("LOWESS", colnames(LOW), ignore.case = TRUE)]]
-      } else LOW[[2]]
-      ma5 <- stats::filter(lowy, rep(1/5, 5), sides = 2)
-      ma5[is.na(ma5)] <- lowy[is.na(ma5)]
-      svec <- diff(as.numeric(ma5)) / diff(as.numeric(lowx))
-      neg_to_flat <- which(diff(sign(svec)) > 0)
-      if (length(neg_to_flat)) Oc <- as.numeric(lowx[neg_to_flat[1] + 1])
-      else Oc <- max(lowx, na.rm = TRUE)
-    }
-    
-    # fNS and slope metrics
-    fNS_median <- if (!is.null(FNS)) {
-      fn_col <- grep("Fn|fn|FNS|Fns", colnames(FNS), value = TRUE)[1]
-      if (!is.na(fn_col)) median(FNS[[fn_col]], na.rm = TRUE)
-      else median(unlist(FNS[, sapply(FNS, is.numeric), drop = FALSE]), na.rm = TRUE)
-    } else NA_real_
-    
-    slope_median <- NA_real_; p_val <- NA_real_; slopes <- NULL
-    if (!is.null(LME)) {
-      slope_col <- grep("Slope|slope|beta", colnames(LME), value = TRUE)[1]
-      if (!is.na(slope_col)) {
-        slopes <- as.numeric(LME[[slope_col]])
-        slope_median <- median(slopes, na.rm = TRUE)
-        p_val <- mean(slopes >= 0, na.rm = TRUE)
-      } else {
-        numeric_cols <- unlist(LME[, sapply(LME, is.numeric), drop = FALSE])
-        slopes <- as.numeric(numeric_cols)
-        slope_median <- median(slopes, na.rm = TRUE)
-        p_val <- mean(slopes >= 0, na.rm = TRUE)
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  dir.create(pd_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  if (is.null(pd_big)) {
+    pd_big <- iCAMP::pdist.big(
+      tree = tree,
+      wd = pd_dir,
+      nworker = nworker
+    )
+  }
+  
+  groups <- data.frame(
+    Sampling = as.character(meta$sampling),
+    Field = as.character(meta$field),
+    Treatment = as.character(meta$treatment),
+    Field_Treatment = interaction(meta$field, meta$treatment, drop = TRUE),
+    Field_Sampling = interaction(meta$field, meta$sampling, drop = TRUE),
+    Field_Treatment_Sampling = interaction(
+      meta$field,
+      meta$treatment,
+      meta$sampling,
+      drop = TRUE
+    ),
+    stringsAsFactors = FALSE,
+    row.names = rownames(meta)
+  )
+  
+  set.seed(423542)
+  
+  icamp_out <- iCAMP::icamp.big(
+    comm = comm,
+    tree = tree,
+    pd.desc = pd_big$pd.file,
+    pd.spname = pd_big$tip.label,
+    pd.wd = pd_big$pd.wd,
+    output.wd = outdir,
+    rand = rand,
+    prefix = paste0(prefix, "_apple_sooty_epiphytes"),
+    ds = ds,
+    phylo.rand.scale = "within.bin",
+    taxa.rand.scale = "across.all",
+    phylo.metric = "bMPD",
+    sig.index = "SES.RC",
+    bin.size.limit = bin_size,
+    nworker = nworker,
+    detail.save = TRUE,
+    qp.save = TRUE,
+    detail.null = FALSE
+  )
+  
+  saveRDS(
+    icamp_out,
+    file.path(outdir, paste0(prefix, "_icamp_full_output.rds"))
+  )
+  
+  icamp_bins <- iCAMP::icamp.bins(
+    icamp.detail = icamp_out,
+    treat = groups,
+    clas = taxonomy,
+    boot = TRUE,
+    rand.time = 100,
+    between.group = TRUE
+  )
+  
+  saveRDS(
+    icamp_bins,
+    file.path(outdir, paste0(prefix, "_icamp_bin_summary.rds"))
+  )
+  
+  # Export all table-like components for Supplementary material.
+  export_icamp_component <- function(x, name) {
+    if (is.data.frame(x) || is.matrix(x)) {
+      write.csv(
+        as.data.frame(x),
+        file.path(outdir, paste0(name, ".csv")),
+        row.names = TRUE
+      )
+    } else if (is.list(x)) {
+      for (i in seq_along(x)) {
+        xi <- x[[i]]
+        nm <- names(x)[i]
+        if (is.null(nm) || nm == "") nm <- paste0("part", i)
+        
+        if (is.data.frame(xi) || is.matrix(xi)) {
+          write.csv(
+            as.data.frame(xi),
+            file.path(
+              outdir,
+              paste0(name, "_", make.names(nm), ".csv")
+            ),
+            row.names = TRUE
+          )
+        }
       }
     }
-    
-    # Craft CI
-    CI_frame <- NULL
-    if (!is.null(CI)) {
-      cis <- find_CI_cols(CI)
-      CI_frame <- data.frame(Overlap = CI[[cis$overlap]],
-                             ymin = if (!is.na(cis$lower)) CI[[cis$lower]] else NA,
-                             y = if (!is.na(cis$median)) CI[[cis$median]] else NA,
-                             ymax = if (!is.na(cis$upper)) CI[[cis$upper]] else NA)
-    } else if (!is.null(LOW)) {
-      CI_frame <- data.frame(Overlap = LOW[[1]],
-                             ymin = NA_real_,
-                             y = if ("LOWESS" %in% colnames(LOW)) LOW$LOWESS else LOW[[2]],
-                             ymax = NA_real_)
-    } else {
-      CI_frame <- data.frame(Overlap = DO$Overlap, ymin = NA_real_, y = NA_real_, ymax = NA_real_)
-    }
-    
-    list(DO = DO, CI = CI_frame, Oc = Oc, fNS_median = fNS_median,
-         slope_median = slope_median, p_value = p_val, slopes = slopes)
   }
   
-  # ---- Extract for all treatments ----
-  metrics <- lapply(doc_list, extract_metrics_from_DOC)
-  names(metrics) <- titles
-  
-  for (i in seq_along(titles)) {
-    metrics[[i]]$DO$Dataset <- titles[i]
-    metrics[[i]]$CI$Dataset <- titles[i]
+  for (nm in names(icamp_bins)) {
+    export_icamp_component(icamp_bins[[nm]], paste0(prefix, "_iCAMP_", nm))
   }
   
-  combined_DO <- dplyr::bind_rows(lapply(metrics, `[[`, "DO"))
-  combined_CI <- dplyr::bind_rows(lapply(metrics, `[[`, "CI"))
-  
-  # ---- Density (same logic as yours) ----
-  y_max <- max(combined_DO$rJSD, na.rm = TRUE)
-  density_scale <- if (is.finite(y_max) && y_max > 0) 0.15 * y_max else 0.15
-  densities <- combined_DO %>%
-    group_by(Dataset) %>%
-    do({
-      od <- .$Overlap
-      if (length(od) < 2 || all(is.na(od))) return(data.frame(x = numeric(0), y = numeric(0)))
-      dens <- stats::density(od,
-                             from = min(combined_DO$Overlap, na.rm = TRUE),
-                             to = max(combined_DO$Overlap, na.rm = TRUE))
-      data.frame(x = dens$x, y = dens$y / max(dens$y) * density_scale)
-    }) %>% ungroup()
-  
-  # ---- Color palette ----
-  col <- c(Control = "#80b1d3", Geoxe = "#fb8072", Ulmasud = "#b3de69")
-  
-  # ---- Plot ----
-  p <- ggplot() +
-    geom_ribbon(data = combined_CI,
-                aes(x = Overlap, ymin = ymin, ymax = ymax, fill = Dataset),
-                alpha = 0.25) +
-    geom_line(data = combined_CI,
-              aes(x = Overlap, y = y, color = Dataset), size = 1) +
-    geom_point(data = combined_DO,
-               aes(x = Overlap, y = rJSD, color = Dataset), size = 0.8, alpha = 0.6) +
-    geom_area(data = densities, aes(x = x, y = y, fill = Dataset),
-              alpha = 0.3, position = "identity") +
-    scale_color_manual(values = col, name = "Treatment") +
-    scale_fill_manual(values = col, name = "Treatment") +
-    theme_bw() +
-    theme(panel.grid.major = element_blank(),
-          panel.grid.minor = element_blank(),
-          legend.position = "top") +
-    xlab("Overlap") + ylab("Dissimilarity (rJSD)") +
-    coord_cartesian(ylim = c(0, 1)) +
-    ggtitle(paste("DOC curves -", phase))
-  
-  # ---- Annotate summary ----
-  fmt <- function(x, d = 2) if (is.na(x)) "NA" else formatC(x, digits = d, format = "f")
-  summary_lines <- sapply(seq_along(titles), function(i) {
-    m <- metrics[[i]]
-    sprintf("%s: Oc=%s | fNS=%s | p=%s",
-            titles[i], fmt(m$Oc), fmt(m$fNS_median), fmt(m$p_value))
-  })
-  summary_text <- paste(summary_lines, collapse = "\n")
-  
-  p <- p + annotate("text",
-                    x = min(combined_DO$Overlap, na.rm = TRUE) + 
-                      0.02 * diff(range(combined_DO$Overlap, na.rm = TRUE)),
-                    y = 0.98, label = summary_text,
-                    hjust = 0, vjust = 1, size = 4,
-                    fontface = "bold", lineheight = 1.05)
-  
-  print(p)
-  return(list(metrics = metrics, plot = p))
+  list(
+    output = icamp_out,
+    bins = icamp_bins,
+    groups = groups,
+    taxonomy = taxonomy,
+    output_directory = outdir
+  )
 }
 
 
-# Harvest phase
-results_Harvest <- analyze_DOC_multi_fromDOC(
-  doc_list = list(doc_Harvest_none, doc_Harvest_ulmasud, doc_Harvest_geoxe),
-  titles = c("Control", "Geoxe", "Ulmasud"),
-  phase = "Harvest"
+extract_icamp_selected_taxa <- function(icamp_run, prefix = "16S") {
+  ptk_raw <- icamp_run$bins$Ptk
+  class_bin <- as.data.frame(
+    icamp_run$bins$Class.Bin,
+    check.names = FALSE
+  )
+  
+  if (is.null(ptk_raw)) {
+    stop("icamp_bins$Ptk is absent; cannot identify selection-dominated bins.")
+  }
+  
+  # Ptk can differ slightly across iCAMP versions/settings. Convert either
+  # one table or a list of tables to a named list and process each safely.
+  ptk_list <- if (is.data.frame(ptk_raw) || is.matrix(ptk_raw)) {
+    list(Ptk = as.data.frame(ptk_raw, check.names = FALSE))
+  } else if (is.list(ptk_raw)) {
+    tmp <- lapply(
+      ptk_raw,
+      function(z) {
+        if (is.data.frame(z) || is.matrix(z)) {
+          as.data.frame(z, check.names = FALSE)
+        } else {
+          NULL
+        }
+      }
+    )
+    tmp[!vapply(tmp, is.null, logical(1))]
+  } else {
+    stop("Unsupported Ptk object class: ", paste(class(ptk_raw), collapse = ", "))
+  }
+  
+  find_one <- function(pattern, x) {
+    hit <- grep(pattern, x, ignore.case = TRUE, value = TRUE)
+    if (length(hit) == 0) NA_character_ else hit[1]
+  }
+  
+  class_bin_col <- find_one("bin", colnames(class_bin))
+  if (is.na(class_bin_col)) {
+    stop(
+      "Could not identify the bin-ID column in Class.Bin. Columns: ",
+      paste(colnames(class_bin), collapse = ", ")
+    )
+  }
+  
+  class_bin$BinID_JOIN <- as.character(class_bin[[class_bin_col]])
+  
+  selected_bins_all <- list()
+  selected_taxa_all <- list()
+  
+  for (nm in names(ptk_list)) {
+    ptk <- ptk_list[[nm]]
+    
+    HoS_col <- find_one("(^HoS$|homogeneous.*selection)", colnames(ptk))
+    HeS_col <- find_one("(^HeS$|heterogeneous.*selection)", colnames(ptk))
+    DL_col  <- find_one("(^DL$|dispersal.*limitation)", colnames(ptk))
+    HD_col  <- find_one("(^HD$|homogenizing.*dispersal)", colnames(ptk))
+    DR_col  <- find_one("(^DR$|drift)", colnames(ptk))
+    bin_col <- find_one("bin", colnames(ptk))
+    
+    if (is.na(HoS_col) || is.na(HeS_col) || is.na(bin_col)) {
+      warning(
+        "Skipping Ptk component '", nm,
+        "' because HoS/HeS/bin columns could not be detected. Columns: ",
+        paste(colnames(ptk), collapse = ", ")
+      )
+      next
+    }
+    
+    process_map <- c(
+      HoS = HoS_col,
+      HeS = HeS_col,
+      DL = DL_col,
+      HD = HD_col,
+      DR = DR_col
+    )
+    process_map <- process_map[!is.na(process_map)]
+    
+    process_matrix <- ptk[, unname(process_map), drop = FALSE]
+    process_matrix[] <- lapply(process_matrix, as.numeric)
+    colnames(process_matrix) <- names(process_map)
+    
+    ptk$HomogeneousSelection <- process_matrix$HoS
+    ptk$HeterogeneousSelection <- process_matrix$HeS
+    ptk$TotalSelection <- process_matrix$HoS + process_matrix$HeS
+    
+    ptk$DominantProcess <- apply(
+      process_matrix,
+      1,
+      function(z) {
+        if (all(is.na(z))) return(NA_character_)
+        names(z)[which.max(z)]
+      }
+    )
+    
+    ptk$SelectionDominated <- ptk$DominantProcess %in% c("HoS", "HeS")
+    ptk$BinID_JOIN <- as.character(ptk[[bin_col]])
+    ptk$PtkComponent <- nm
+    
+    selected_bins <- ptk %>%
+      filter(SelectionDominated) %>%
+      arrange(desc(TotalSelection))
+    
+    selected_taxa <- selected_bins %>%
+      inner_join(
+        class_bin,
+        by = "BinID_JOIN",
+        suffix = c("_Process", "_Taxonomy")
+      ) %>%
+      arrange(desc(TotalSelection))
+    
+    selected_bins_all[[nm]] <- selected_bins
+    selected_taxa_all[[nm]] <- selected_taxa
+  }
+  
+  selected_bins_df <- bind_rows(selected_bins_all)
+  selected_taxa_df <- bind_rows(selected_taxa_all)
+  
+  outdir <- icamp_run$output_directory
+  
+  write.csv(
+    selected_bins_df,
+    file.path(outdir, paste0(prefix, "_selection_dominated_bins.csv")),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    selected_taxa_df,
+    file.path(outdir, paste0(prefix, "_taxa_in_selection_dominated_bins.csv")),
+    row.names = FALSE
+  )
+  
+  # Genus-level reviewer table when genus taxonomy is available.
+  genus_col <- grep(
+    "^Genus$",
+    colnames(selected_taxa_df),
+    ignore.case = TRUE,
+    value = TRUE
+  )
+  
+  if (length(genus_col) == 1L && nrow(selected_taxa_df) > 0) {
+    selected_genera <- selected_taxa_df %>%
+      filter(!is.na(.data[[genus_col]]), .data[[genus_col]] != "") %>%
+      group_by(
+        PtkComponent,
+        DominantProcess,
+        .data[[genus_col]]
+      ) %>%
+      summarise(
+        N_ASVs = n(),
+        Mean_TotalSelection = mean(TotalSelection, na.rm = TRUE),
+        Max_TotalSelection = max(TotalSelection, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      arrange(desc(Max_TotalSelection))
+    
+    write.csv(
+      selected_genera,
+      file.path(outdir, paste0(prefix, "_selected_genera_summary.csv")),
+      row.names = FALSE
+    )
+  }
+  
+  list(
+    selected_bins = selected_bins_df,
+    selected_taxa = selected_taxa_df
+  )
+}
+
+# -----------------------------------------------------------------------------
+# 16S iCAMP
+# -----------------------------------------------------------------------------
+# No meaningful continuous environmental/niche variables are currently supplied,
+# therefore ps.bin is intentionally skipped. If you have measured continuous
+# variables, create a numeric data.frame with Sample IDs as row names and pass it
+# as env_numeric below.
+ICAMP_ENV_NUMERIC_16S <- NULL
+ICAMP_BIN_CANDIDATES <- c(12L, 24L, 48L)
+ICAMP_BIN_SIZE_16S <- 24L
+ICAMP_RAND <- 1000L
+ICAMP_WORKERS <- 2L
+
+bincheck <- run_icamp_bin_diagnostics(
+  physeq_asv_filtered,
+  prefix = "16S",
+  bin_sizes = ICAMP_BIN_CANDIDATES,
+  nworker = ICAMP_WORKERS,
+  env_numeric = ICAMP_ENV_NUMERIC_16S
 )
 
-# Storage phase
-results_Storage <- analyze_DOC_multi_fromDOC(
-  doc_list = list(doc_Storage_none, doc_Storage_ulmasud, doc_Storage_geoxe),
-  titles = c("Control", "Geoxe", "Ulmasud"),
-  phase = "Storage"
+icamp <- run_icamp_reviewer(
+  physeq_asv_filtered,
+  prefix = "16S",
+  bin_size = ICAMP_BIN_SIZE_16S,
+  rand = ICAMP_RAND,
+  nworker = ICAMP_WORKERS,
+  pd_big = bincheck$pd_big,
+  pd_dir = bincheck$pd_dir
 )
 
-its_doc <- readRDS("doc_its.RDS")
-its_doc
-shared_legend <- get_legend(
-  its_doc +
-    theme(
+selected_taxa <- extract_icamp_selected_taxa(
+  icamp,
+  prefix = "16S"
+)
+
+print(icamp$bins$Pt)
+print(head(icamp$bins$Ptk))
+print(head(icamp$bins$Class.Bin))
+print(head(selected_taxa$selected_taxa))
+
+# =========================================================
+# PLOT ASSEMBLY MECHANISMS AT HARVEST VS STORAGE
+# =========================================================
+#
+# Goal:
+# show the relative importance of the five assembly processes
+# separately at Harvest and at Storage.
+#
+# Each panel = one Field x Treatment combination
+# Each panel contains two stacked bars:
+#   Harvest
+#   Storage
+# =========================================================
+
+
+# ---------------------------------------------------------
+# Helper: convert Pt to data.frame
+# ---------------------------------------------------------
+icamp_component_to_df <- function(x, component_name = "iCAMP component") {
+  
+  if (is.data.frame(x) || is.matrix(x)) {
+    return(
+      as.data.frame(
+        x,
+        check.names = FALSE,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+  
+  if (is.list(x)) {
+    
+    keep <- vapply(
+      x,
+      function(z) is.data.frame(z) || is.matrix(z),
+      logical(1)
+    )
+    
+    x <- x[keep]
+    
+    if (length(x) == 0L) {
+      stop(component_name, " contains no table-like elements.")
+    }
+    
+    nm <- names(x)
+    if (is.null(nm)) nm <- paste0("part", seq_along(x))
+    nm[nm == ""] <- paste0("part", which(nm == ""))
+    
+    pieces <- lapply(
+      seq_along(x),
+      function(i) {
+        z <- as.data.frame(
+          x[[i]],
+          check.names = FALSE,
+          stringsAsFactors = FALSE
+        )
+        z$.iCAMP_component <- nm[i]
+        z
+      }
+    )
+    
+    return(dplyr::bind_rows(pieces))
+  }
+  
+  stop(
+    "Unsupported class for ",
+    component_name,
+    ": ",
+    paste(class(x), collapse = ", ")
+  )
+}
+
+
+# ---------------------------------------------------------
+# Helper: identify process columns
+# ---------------------------------------------------------
+detect_icamp_process_columns <- function(dat) {
+  
+  find_one <- function(pattern) {
+    hit <- grep(
+      pattern,
+      colnames(dat),
+      ignore.case = TRUE,
+      value = TRUE
+    )
+    if (length(hit) == 0L) return(NA_character_)
+    hit[1]
+  }
+  
+  out <- c(
+    HeS = find_one("(^HeS$|heterogeneous.*selection)"),
+    HoS = find_one("(^HoS$|homogeneous.*selection)"),
+    DL  = find_one("(^DL$|dispersal.*limitation)"),
+    HD  = find_one("(^HD$|homogenizing.*dispersal)"),
+    DR  = find_one("(^DR$|drift)")
+  )
+  
+  if (any(is.na(out))) {
+    stop(
+      paste0(
+        "Could not identify all process columns.\n",
+        "Detected:\n",
+        paste(names(out), "=", out, collapse = "\n"),
+        "\n\nAvailable columns:\n",
+        paste(colnames(dat), collapse = ", ")
+      )
+    )
+  }
+  
+  out
+}
+
+
+# ---------------------------------------------------------
+# Helper: treatment labels
+#
+# Works for BOTH:
+#   1. stagewise tables containing Sampling
+#   2. Harvest-vs-Storage transition tables without Sampling
+# ---------------------------------------------------------
+
+add_icamp_treatment_labels <- function(dat) {
+  
+  dat <- dat %>%
+    dplyr::mutate(
+      
+      Field =
+        as.character(.data$Field),
+      
+      Treatment =
+        as.character(.data$Treatment),
+      
+      Treatment_label =
+        dplyr::case_when(
+          
+          Field == "Pfatten/Vadena" &
+            Treatment == "Control" ~
+            "Control",
+          
+          Field == "Pfatten/Vadena" &
+            Treatment == "Geoxe" ~
+            "Fludioxonil",
+          
+          Field == "Pfatten/Vadena" &
+            Treatment == "Ulmasud" ~
+            "Acidic clays",
+          
+          Field == "Sinich/Sinigo" &
+            Treatment == "Control" ~
+            "Control",
+          
+          Field == "Sinich/Sinigo" &
+            Treatment == "Geoxe" ~
+            "Captan + Fludioxonil",
+          
+          Field == "Sinich/Sinigo" &
+            Treatment == "Ulmasud" ~
+            "Captan + Acidic clays",
+          
+          TRUE ~
+            Treatment
+        ),
+      
+      Field =
+        factor(
+          Field,
+          levels = c(
+            "Pfatten/Vadena",
+            "Sinich/Sinigo"
+          )
+        )
+    )
+  
+  
+  # -------------------------------------------------------
+  # Only standardize Sampling when the table actually
+  # contains a Sampling column.
+  #
+  # BPtk Harvest-vs-Storage transition tables do NOT have
+  # one single Sampling value, so this must be skipped.
+  # -------------------------------------------------------
+  
+  if ("Sampling" %in% colnames(dat)) {
+    
+    dat <- dat %>%
+      dplyr::mutate(
+        
+        Sampling =
+          factor(
+            as.character(.data$Sampling),
+            levels = c(
+              "Harvest",
+              "Storage"
+            )
+          )
+      )
+  }
+  
+  
+  dat
+}
+
+# ---------------------------------------------------------
+# Extract WITHIN-GROUP process weights
+# ---------------------------------------------------------
+extract_icamp_process_weights_by_stage <- function(
+    icamp_run,
+    prefix = "16S"
+) {
+  
+  pt <- icamp_component_to_df(
+    icamp_run$bins$Pt,
+    component_name = "Pt"
+  )
+  
+  # Keep Field_Treatment_Sampling summaries
+  pt_stage <- pt %>%
+    dplyr::mutate(
+      GroupBasedOn = as.character(GroupBasedOn),
+      Group = as.character(Group)
+    ) %>%
+    dplyr::filter(
+      GroupBasedOn == "Field_Treatment_Sampling"
+    )
+  
+  # We want SINGLE groups, not Harvest_vs_Storage transitions
+  pt_stage <- pt_stage %>%
+    dplyr::filter(
+      !grepl("_vs_", Group)
+    )
+  
+  # If Field/Treatment/Sampling columns are not already present, recover them from icamp_run$groups
+  if (!all(c("Field", "Treatment", "Sampling") %in% colnames(pt_stage))) {
+    
+    lookup <- icamp_run$groups %>%
+      dplyr::mutate(
+        Group = as.character(Field_Treatment_Sampling),
+        Field = as.character(Field),
+        Treatment = as.character(Treatment),
+        Sampling = as.character(Sampling)
+      ) %>%
+      dplyr::distinct(Group, Field, Treatment, Sampling)
+    
+    pt_stage <- pt_stage %>%
+      dplyr::left_join(
+        lookup,
+        by = "Group"
+      )
+  }
+  
+  if (!all(c("Field", "Treatment", "Sampling") %in% colnames(pt_stage))) {
+    stop("Could not recover Field, Treatment and Sampling information from Pt.")
+  }
+  
+  process_map <- detect_icamp_process_columns(pt_stage)
+  col_to_process <- stats::setNames(names(process_map), unname(process_map))
+  
+  pt_long <- pt_stage %>%
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(unname(process_map)),
+      names_to = "ProcessColumn",
+      values_to = "Weight"
+    ) %>%
+    dplyr::mutate(
+      Weight = as.numeric(Weight),
+      ProcessCode = unname(col_to_process[ProcessColumn]),
+      Process = dplyr::recode(
+        ProcessCode,
+        "HeS" = "Heterogeneous selection",
+        "HoS" = "Homogeneous selection",
+        "DL"  = "Dispersal limitation",
+        "HD"  = "Homogenizing dispersal",
+        "DR"  = "Drift"
+      ),
+      Process = factor(
+        Process,
+        levels = c(
+          "Heterogeneous selection",
+          "Homogeneous selection",
+          "Dispersal limitation",
+          "Homogenizing dispersal",
+          "Drift"
+        )
+      )
+    ) %>%
+    add_icamp_treatment_labels()
+  
+  # useful check
+  sum_check <- pt_long %>%
+    dplyr::group_by(Field, Treatment_label, Sampling) %>%
+    dplyr::summarise(
+      Total = sum(Weight, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  print(sum_check)
+  
+  utils::write.csv(
+    pt_long,
+    file.path(
+      icamp_run$output_directory,
+      paste0(prefix, "_iCAMP_process_weights_Harvest_vs_Storage_stagewise.csv")
+    ),
+    row.names = FALSE
+  )
+  
+  utils::write.csv(
+    sum_check,
+    file.path(
+      icamp_run$output_directory,
+      paste0(prefix, "_iCAMP_process_weights_stagewise_sumcheck.csv")
+    ),
+    row.names = FALSE
+  )
+  
+  pt_long
+}
+
+
+process_stagewise <- extract_icamp_process_weights_by_stage(
+  icamp,
+  prefix = "16S"
+)
+
+
+# ---------------------------------------------------------
+# Colours
+# ---------------------------------------------------------
+icamp_process_colours <- c(
+  "Heterogeneous selection" = "#D55E00",
+  "Homogeneous selection" = "#E69F00",
+  "Dispersal limitation" = "#0072B2",
+  "Homogenizing dispersal" = "#56B4E9",
+  "Drift" = "#999999"
+)
+
+
+# ---------------------------------------------------------
+# Final plot: Harvest vs Storage
+# ---------------------------------------------------------
+process_stagewise <- process_stagewise %>%
+  dplyr::mutate(
+    Treatment_label = factor(
+      Treatment_label,
+      levels = c(
+        "Control",
+        "Fludioxonil",
+        "Acidic clays",
+        "Captan + Fludioxonil",
+        "Captan + Acidic clays"
+      )
+    )
+  )
+
+# ---------------------------------------------------------
+# Remove empty panels by plotting each orchard separately
+# ---------------------------------------------------------
+
+library(patchwork)
+
+process_stagewise_plot <- process_stagewise %>%
+  dplyr::mutate(
+    Treatment_label = as.character(Treatment_label),
+    Sampling = factor(Sampling, levels = c("Harvest", "Storage"))
+  )
+
+# Field-specific treatment order
+pfatten_levels <- c(
+  "Control",
+  "Fludioxonil",
+  "Acidic clays"
+)
+
+sinich_levels <- c(
+  "Control",
+  "Captan + Fludioxonil",
+  "Captan + Acidic clays"
+)
+
+pfatten_dat <- process_stagewise_plot %>%
+  dplyr::filter(Field == "Pfatten/Vadena") %>%
+  dplyr::mutate(
+    Treatment_label = factor(
+      Treatment_label,
+      levels = pfatten_levels
+    )
+  )
+
+sinich_dat <- process_stagewise_plot %>%
+  dplyr::filter(Field == "Sinich/Sinigo") %>%
+  dplyr::mutate(
+    Treatment_label = factor(
+      Treatment_label,
+      levels = sinich_levels
+    )
+  )
+
+# ---------------------------------------------------------
+# Pfatten/Vadena
+# ---------------------------------------------------------
+
+p_icamp_pfatten <- ggplot2::ggplot(
+  pfatten_dat,
+  ggplot2::aes(
+    x = Sampling,
+    y = Weight,
+    fill = Process
+  )
+) +
+  ggplot2::geom_col(
+    width = 0.72,
+    color = "black",
+    linewidth = 0.25
+  ) +
+  ggplot2::facet_wrap(
+    ~ Treatment_label,
+    nrow = 1,
+    scales = "free_x"
+  ) +
+  ggplot2::scale_fill_manual(
+    values = icamp_process_colours,
+    drop = FALSE
+  ) +
+  ggplot2::scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    lim16S = c(0, 1),
+    expand = ggplot2::expansion(mult = c(0, 0.02))
+  ) +
+  ggplot2::labs(
+    title = "Pfatten/Vadena",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_nature +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18
+    ),
+    axis.text.x = ggplot2::element_text(
+      angle = 30,
+      hjust = 1,
+      size = 12
+    ),
+    strip.text = ggplot2::element_text(
+      size = 13,
+      face = "bold"
+    ),
+    legend.position = "none"
+  )
+
+
+# ---------------------------------------------------------
+# Sinich/Sinigo
+# ---------------------------------------------------------
+
+p_icamp_sinich <- ggplot2::ggplot(
+  sinich_dat,
+  ggplot2::aes(
+    x = Sampling,
+    y = Weight,
+    fill = Process
+  )
+) +
+  ggplot2::geom_col(
+    width = 0.72,
+    color = "black",
+    linewidth = 0.25
+  ) +
+  ggplot2::facet_wrap(
+    ~ Treatment_label,
+    nrow = 1,
+    scales = "free_x"
+  ) +
+  ggplot2::scale_fill_manual(
+    values = icamp_process_colours,
+    drop = FALSE
+  ) +
+  ggplot2::scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    lim16S = c(0, 1),
+    expand = ggplot2::expansion(mult = c(0, 0.02))
+  ) +
+  ggplot2::labs(
+    title = "Sinich/Sinigo",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_nature +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18
+    ),
+    axis.text.x = ggplot2::element_text(
+      angle = 30,
+      hjust = 1,
+      size = 12
+    ),
+    strip.text = ggplot2::element_text(
+      size = 13,
+      face = "bold"
+    ),
+    legend.position = "none"
+  )
+
+
+# ---------------------------------------------------------
+# Shared legend
+# ---------------------------------------------------------
+
+legend_icamp <- cowplot::get_legend(
+  p_icamp_pfatten +
+    ggplot2::theme(
       legend.position = "bottom",
-      legend.direction = "horizontal",
-      legend.box = "horizontal"
-    ) +
-    guides(
-      fill = guide_legend(nrow = 1),
-      color = guide_legend(nrow = 1)
+      legend.title = ggplot2::element_text(
+        size = 12,
+        face = "bold"
+      ),
+      legend.text = ggplot2::element_text(
+        size = 11
+      )
     )
 )
 
 
+# ---------------------------------------------------------
+# Combine orchard panels
+# NO overall title
+# NO subtitle
+# NO repeated y-axis title
+# ---------------------------------------------------------
 
-
-
-# add Mantel tests 
-p_beta_bac <- p_beta_bac + theme_nature
-p_beta <- readRDS("Mantel.RDS")
-
-# -----------------------------
-# 1. Load plots
-# -----------------------------
-
-doc_fun <- its_doc                     # fungi DOC
-doc_bac <- results_combined$plot+ theme_nature      # bacteria DOC
-doc_fun
-doc_bac
-# -----------------------------
-# 2. Shared colour scheme
-# -----------------------------
-shared_colors <- c(
-  Harvest = "#E64B35",
-  Storage = "#4DBBD5"
-)
-
-apply_shared_scale <- function(p) {
-  p +
-    scale_color_manual(values = shared_colors, name = "Sampling") +
-    scale_fill_manual(values = shared_colors, name = "Sampling")
-}
-
-p_beta_ <- apply_shared_scale(p_beta)
-p_beta_bac <- apply_shared_scale(p_beta_bac)
-doc_fun    <- apply_shared_scale(doc_fun)
-doc_bac    <- apply_shared_scale(doc_bac)
-
-
-# -----------------------------
-# 3. Extract ONE legend
-# -----------------------------
-shared_legend <- get_legend(
-  p_beta_bac +
-    theme(
-      legend.position = "top",
-      legend.title = element_text(face = "bold")
-    )
-)
-
-
-# -----------------------------
-# 4. Remove legends from panels
-# -----------------------------
-p_beta <- p_beta + theme(legend.position = "none")
-p_beta_bac <- p_beta_bac + theme(legend.position = "none")
-doc_fun    <- doc_fun    + theme(legend.position = "none")
-doc_bac    <- doc_bac    + theme(legend.position = "none")
-
-
-# -----------------------------
-# 5. Arrange panels
-# -----------------------------
-
-# Top row: Mantel
-row_mantel <- plot_grid(
-  p_beta,
-  p_beta_bac,
-  ncol = 2,
-  labels = c("A", "B"),
-  label_size = 15,
-  label_fontface = "bold",
-  label_x = 0.01,
-  label_y = 0.98,
-  hjust = 0,
-  vjust = 1
-)
-
-# Bottom row: DOC
-row_doc <- plot_grid(
-  doc_fun,
-  doc_bac,
-  ncol = 2,
-  labels = c("A", "B"),
-  label_size = 15,
-  label_fontface = "bold",
-  label_x = 0.01,
-  label_y = 0.98,
-  hjust = 0,
-  vjust = 1
-)
-
-# Combine rows
-main_panels <- plot_grid(
-  row_doc,
+p_icamp_core <- cowplot::plot_grid(
+  p_icamp_pfatten,
+  p_icamp_sinich,
   ncol = 1,
+  align = "v",
+  axis = "lr",
   rel_heights = c(1, 1)
 )
 
-# -----------------------------
-# 6. Final figure with legend
-# -----------------------------
-final_plot <- plot_grid(
-  main_panels,
-  shared_legend,
-  ncol = 1,
-  rel_heights = c(1, 0.12)
+
+# ---------------------------------------------------------
+# Add ONE shared y-axis title
+# ---------------------------------------------------------
+
+p_icamp_process_stagewise_clean <- cowplot::ggdraw() +
+  
+  cowplot::draw_plot(
+    p_icamp_core,
+    x = 0.07,
+    y = 0.12,
+    width = 0.93,
+    height = 0.88
+  ) +
+  
+  cowplot::draw_plot(
+    legend_icamp,
+    x = 0.07,
+    y = 0.00,
+    width = 0.93,
+    height = 0.12
+  ) +
+  
+  cowplot::draw_label(
+    "Relative importance of assembly processes",
+    x = 0.018,
+    y = 0.56,
+    angle = 90,
+    fontface = "bold",
+    size = 18
+  )
+
+
+p_icamp_process_stagewise_clean
+# =========================================================
+# 9B. BIN CONTRIBUTIONS TO EACH PROCESS: BPtk
+# =========================================================
+extract_icamp_bin_contributions_HS <- function(
+    icamp_run,
+    prefix = "16S"
+) {
+  
+  bptk <- icamp_component_to_df(
+    icamp_run$bins$BPtk,
+    component_name = "BPtk"
+  )
+  
+  
+  bptk_hs <- filter_icamp_HS_transition(
+    bptk,
+    icamp_run
+  )
+  
+  
+  required <- c(
+    "Process",
+    "Field",
+    "Treatment"
+  )
+  
+  
+  missing <- setdiff(
+    required,
+    colnames(bptk_hs)
+  )
+  
+  
+  if (length(missing) > 0L) {
+    
+    stop(
+      "BPtk Harvest-vs-Storage table is missing: ",
+      paste(missing, collapse = ", ")
+    )
+  }
+  
+  
+  non_bin_columns <- c(
+    
+    "Method",
+    
+    "GroupBasedOn",
+    
+    "Group",
+    
+    "Process",
+    
+    "Field",
+    
+    "Treatment",
+    
+    ".iCAMP_component"
+  )
+  
+  
+  candidate_bins <- setdiff(
+    colnames(bptk_hs),
+    non_bin_columns
+  )
+  
+  
+  # Retain columns that are genuinely numeric bin-contribution columns.
+  numericish <- vapply(
+    
+    bptk_hs[
+      candidate_bins
+    ],
+    
+    function(z) {
+      
+      z_num <-
+        suppressWarnings(
+          as.numeric(
+            as.character(
+              z
+            )
+          )
+        )
+      
+      any(
+        !is.na(
+          z_num
+        )
+      ) &&
+        all(
+          is.na(z) |
+            !is.na(z_num)
+        )
+    },
+    
+    logical(1)
+  )
+  
+  
+  bin_columns <-
+    candidate_bins[
+      numericish
+    ]
+  
+  
+  if (length(bin_columns) == 0L) {
+    
+    stop(
+      paste0(
+        "No numeric bin columns were identified in BPtk.\n",
+        "Available columns:\n",
+        paste(
+          colnames(bptk_hs),
+          collapse = ", "
+        )
+      )
+    )
+  }
+  
+  
+  bptk_long <- bptk_hs %>%
+    tidyr::pivot_longer(
+      
+      cols =
+        dplyr::all_of(
+          bin_columns
+        ),
+      
+      names_to =
+        "Bin",
+      
+      values_to =
+        "Contribution"
+    ) %>%
+    dplyr::mutate(
+      
+      Contribution =
+        as.numeric(
+          Contribution
+        ),
+      
+      ProcessCode =
+        standardize_icamp_process(
+          Process
+        ),
+      
+      Process =
+        dplyr::recode(
+          
+          ProcessCode,
+          
+          "HeS" =
+            "Heterogeneous selection",
+          
+          "HoS" =
+            "Homogeneous selection",
+          
+          "DL" =
+            "Dispersal limitation",
+          
+          "HD" =
+            "Homogenizing dispersal",
+          
+          "DR" =
+            "Drift"
+        ),
+      
+      Process =
+        factor(
+          Process,
+          levels = c(
+            "Heterogeneous selection",
+            "Homogeneous selection",
+            "Dispersal limitation",
+            "Homogenizing dispersal",
+            "Drift"
+          )
+        )
+    ) %>%
+    add_icamp_treatment_labels() %>%
+    dplyr::mutate(
+      
+      Panel =
+        paste0(
+          as.character(
+            Field
+          ),
+          "\n",
+          Treatment_label
+        )
+    )
+  
+  
+  # Order bins numerically when possible.
+  bin_number <-
+    suppressWarnings(
+      readr::parse_number(
+        as.character(
+          bptk_long$Bin
+        )
+      )
+    )
+  
+  
+  bin_order_df <- tibble::tibble(
+    
+    Bin =
+      as.character(
+        bptk_long$Bin
+      ),
+    
+    BinNumber =
+      bin_number
+  ) %>%
+    dplyr::distinct() %>%
+    dplyr::arrange(
+      is.na(BinNumber),
+      BinNumber,
+      Bin
+    )
+  
+  
+  bptk_long$Bin <-
+    factor(
+      
+      bptk_long$Bin,
+      
+      levels =
+        bin_order_df$Bin
+    )
+  
+  
+  # -------------------------------------------------------
+  # Total assembly contribution of each bin
+  # -------------------------------------------------------
+  bin_total <- bptk_long %>%
+    dplyr::group_by(
+      Field,
+      Treatment,
+      Treatment_label,
+      Panel,
+      Bin
+    ) %>%
+    dplyr::summarise(
+      
+      TotalBinAssemblyContribution =
+        sum(
+          Contribution,
+          na.rm = TRUE
+        ),
+      
+      .groups =
+        "drop"
+    )
+  
+  
+  # -------------------------------------------------------
+  # Selection contribution of each bin
+  #
+  # Absolute contribution:
+  #   HeS + HoS contribution to total community assembly.
+  #
+  # SelectionShare:
+  #   fraction of ALL selection attributable to that bin.
+  # -------------------------------------------------------
+  selection_bins <- bptk_long %>%
+    dplyr::filter(
+      ProcessCode %in%
+        c(
+          "HeS",
+          "HoS"
+        )
+    ) %>%
+    dplyr::group_by(
+      Field,
+      Treatment,
+      Treatment_label,
+      Panel,
+      Bin
+    ) %>%
+    dplyr::summarise(
+      
+      HeS_contribution =
+        sum(
+          Contribution[
+            ProcessCode ==
+              "HeS"
+          ],
+          na.rm = TRUE
+        ),
+      
+      HoS_contribution =
+        sum(
+          Contribution[
+            ProcessCode ==
+              "HoS"
+          ],
+          na.rm = TRUE
+        ),
+      
+      TotalSelectionContribution =
+        sum(
+          Contribution,
+          na.rm = TRUE
+        ),
+      
+      .groups =
+        "drop"
+    ) %>%
+    dplyr::group_by(
+      Field,
+      Treatment
+    ) %>%
+    dplyr::mutate(
+      
+      TotalSelection =
+        sum(
+          TotalSelectionContribution,
+          na.rm = TRUE
+        ),
+      
+      SelectionShare =
+        dplyr::if_else(
+          
+          TotalSelection > 0,
+          
+          TotalSelectionContribution /
+            TotalSelection,
+          
+          NA_real_
+        )
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::arrange(
+      Field,
+      Treatment,
+      dplyr::desc(
+        TotalSelectionContribution
+      )
+    )
+  
+  
+  outdir <-
+    icamp_run$output_directory
+  
+  
+  utils::write.csv(
+    
+    bptk_long,
+    
+    file.path(
+      outdir,
+      paste0(
+        prefix,
+        "_iCAMP_BPtk_bin_process_contributions_Harvest_vs_Storage.csv"
+      )
+    ),
+    
+    row.names = FALSE
+  )
+  
+  
+  utils::write.csv(
+    
+    bin_total,
+    
+    file.path(
+      outdir,
+      paste0(
+        prefix,
+        "_iCAMP_total_bin_contribution_Harvest_vs_Storage.csv"
+      )
+    ),
+    
+    row.names = FALSE
+  )
+  
+  
+  utils::write.csv(
+    
+    selection_bins,
+    
+    file.path(
+      outdir,
+      paste0(
+        prefix,
+        "_iCAMP_selection_bin_contribution_Harvest_vs_Storage.csv"
+      )
+    ),
+    
+    row.names = FALSE
+  )
+  
+  
+  list(
+    
+    long =
+      bptk_long,
+    
+    bin_total =
+      bin_total,
+    
+    selection =
+      selection_bins
+  )
+}
+
+
+bin_contribution_HS <-
+  extract_icamp_bin_contributions_HS(
+    icamp,
+    prefix = "16S"
+  )
+
+
+
+# ---------------------------------------------------------
+# BIN FIGURE
+#
+# Each stacked bar = one phylogenetic bin.
+#
+# Height:
+#   contribution of that bin to total community assembly.
+#
+# Colours:
+#   process(es) to which that bin contributed across the
+#   Harvest-vs-Storage turnovers.
+# ---------------------------------------------------------
+p_icamp_bins <- ggplot2::ggplot(
+  
+  bin_contribution_HS$long,
+  
+  ggplot2::aes(
+    x = Bin,
+    y = Contribution,
+    fill = Process
+  )
+  
+) +
+  
+  ggplot2::geom_col(
+    
+    width =
+      0.82,
+    
+    color =
+      "black",
+    
+    linewidth =
+      0.15
+  ) +
+  
+  ggplot2::facet_wrap(
+    
+    ~ Panel,
+    
+    ncol =
+      3
+  ) +
+  
+  ggplot2::scale_fill_manual(
+    
+    values =
+      icamp_process_colours,
+    
+    drop =
+      FALSE
+  ) +
+  
+  ggplot2::scale_y_continuous(
+    
+    labels =
+      scales::percent_format(
+        accuracy = 0.1
+      ),
+    
+    expand =
+      ggplot2::expansion(
+        mult = c(
+          0,
+          0.05
+        )
+      )
+  ) +
+  
+  ggplot2::labs(
+    
+    x =
+      "Phylogenetic bin",
+    
+    y =
+      "Bin contribution to community assembly",
+    
+    fill =
+      "Assembly process",
+    
+    subtitle =
+      "Bin-level contribution to Harvest–Storage turnover"
+  ) +
+  
+  theme_nature +
+  
+  ggplot2::theme(
+    
+    axis.text.x =
+      ggplot2::element_text(
+        angle = 90,
+        hjust = 1,
+        vjust = 0.5,
+        size = 9
+      ),
+    
+    strip.text =
+      ggplot2::element_text(
+        size = 13,
+        face = "bold"
+      ),
+    
+    legend.position =
+      "bottom",
+    
+    legend.title =
+      ggplot2::element_text(
+        size = 13,
+        face = "bold"
+      ),
+    
+    legend.text =
+      ggplot2::element_text(
+        size = 12
+      ),
+    
+    plot.subtitle =
+      ggplot2::element_text(
+        hjust = 0.5,
+        size = 14
+      )
+  )
+
+
+p_icamp_bins
+
+
+saveRDS(
+  
+  p_icamp_bins,
+  
+  file.path(
+    icamp$output_directory,
+    "16S_iCAMP_bin_contributions_Harvest_vs_Storage_plot.RDS"
+  )
 )
 
-final_plot
+
+ggplot2::ggsave(
+  
+  filename =
+    file.path(
+      icamp$output_directory,
+      "16S_iCAMP_bin_contributions_Harvest_vs_Storage.png"
+    ),
+  
+  plot =
+    p_icamp_bins,
+  
+  width =
+    13,
+  
+  height =
+    8,
+  
+  un16S =
+    "in",
+  
+  dpi =
+    600,
+  
+  bg =
+    "white"
+)
 
 
 
-df <- read_delim("network_summary.txt")
-# 2️⃣ View the first few rows (optional)
-head(df)
+# =========================================================
+# 9C. TABLE TO USE MANUALLY FOR SELECTION TEXT
+# =========================================================
+#
+# This is the table I recommend using when writing the
+# Results paragraph about bins under selection.
+#
+# TotalSelectionContribution:
+#   absolute contribution of that bin to community assembly
+#   through HeS + HoS.
+#
+# SelectionShare:
+#   proportion of total selection attributable to that bin.
+#
+# Example interpretation:
+#   SelectionShare = 0.42
+#   -> that bin accounts for 42% of the selection signal
+#      in that Field x Treatment Harvest-vs-Storage turnover.
+# =========================================================
 
-# 3️⃣ Convert to a gt table
-gt_table <- gt(df)
+election_bin_table <-
+  bin_contribution_HS$selection %>%
+  dplyr::mutate(
+    
+    TotalSelectionContribution_percent =
+      100 *
+      TotalSelectionContribution,
+    
+    SelectionShare_percent =
+      100 *
+      SelectionShare
+  )
 
-# 4️⃣ Print the gt table (renders nicely in RStudio / Quarto / HTML)
-gt_table
+
+print(
+  selection_bin_table
+)
+
+
+utils::write.csv(
+  
+  selection_bin_table,
+  
+  file.path(
+    icamp$output_directory,
+    "16S_iCAMP_SELECTION_BINS_FOR_MANUSCRIPT.csv"
+  ),
+  
+  row.names = FALSE
+)
+
+
+
+# =========================================================
+# 9D. OPTIONAL SELECTION-ONLY BIN PLOT
+# =========================================================
+#
+# Not required for the main manuscript figure.
+# Useful for inspection / Supplementary material.
+# =========================================================
+
+p_icamp_selection_bins <- ggplot2::ggplot(
+  
+  selection_bin_table,
+  
+  ggplot2::aes(
+    x = Bin,
+    y = TotalSelectionContribution,
+    fill = Treatment_label
+  )
+  
+) +
+  
+  ggplot2::geom_col(
+    width = 0.8
+  ) +
+  
+  ggplot2::facet_wrap(
+    ~ Field,
+    nrow = 2,
+    scales = "free_x"
+  ) +
+  
+  ggplot2::scale_y_continuous(
+    labels =
+      scales::percent_format(
+        accuracy = 0.1
+      )
+  ) +
+  
+  ggplot2::labs(
+    
+    x =
+      "Phylogenetic bin",
+    
+    y =
+      "Contribution to selection\n(HeS + HoS)",
+    
+    fill =
+      "Treatment",
+    
+    subtitle =
+      "Selection component of Harvest–Storage turnover"
+  ) +
+  
+  theme_nature +
+  
+  ggplot2::theme(
+    
+    axis.text.x =
+      ggplot2::element_text(
+        angle = 90,
+        hjust = 1,
+        vjust = 0.5,
+        size = 9
+      ),
+    
+    legend.position =
+      "bottom"
+  )
+
+
+p_icamp_selection_bins
+
+
+saveRDS(
+  
+  p_icamp_selection_bins,
+  
+  file.path(
+    icamp$output_directory,
+    "16S_iCAMP_selection_bin_contributions_plot.RDS"
+  )
+)
+
+
 
